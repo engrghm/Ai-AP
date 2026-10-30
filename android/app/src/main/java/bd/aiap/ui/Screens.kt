@@ -11,6 +11,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -26,15 +27,19 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.AccountBalanceWallet
 import androidx.compose.material.icons.filled.Alarm
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Forum
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.NightsStay
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.TaskAlt
@@ -46,6 +51,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -55,6 +61,7 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -73,8 +80,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
+import bd.aiap.HabitRow
 import bd.aiap.MainViewModel
+import bd.aiap.core.EXPENSE_CATEGORIES
+import bd.aiap.core.Expense
 import bd.aiap.core.ListItem
+import bd.aiap.core.PhoneAction
 import bd.aiap.core.MEMORY_CATEGORIES
 import bd.aiap.core.Memory
 import bd.aiap.core.Reminder
@@ -89,6 +100,7 @@ private enum class Tab(val label: String, val title: String, val icon: ImageVect
     MEMORY("তথ্য", "যা মনে রেখেছি", Icons.Filled.Psychology),
     LISTS("লিস্ট", "আমার লিস্ট", Icons.Filled.TaskAlt),
     REMINDERS("রিমাইন্ডার", "রিমাইন্ডার", Icons.Filled.Alarm),
+    TRACKER("হিসাব", "হিসাব ও অভ্যাস", Icons.Filled.AccountBalanceWallet),
 }
 
 private val LIST_NAMES = mapOf(
@@ -114,7 +126,12 @@ fun AppRoot(vm: MainViewModel) {
                 title = { Text(tab.title) },
                 actions = {
                     if (tab == Tab.CHAT) {
-                        IconButton(onClick = vm::briefingNow, enabled = vm.pending == null) { Icon(Icons.Filled.WbSunny, "আজকের পরিকল্পনা") }
+                        IconButton(onClick = { vm.briefingNow("morning") }, enabled = vm.pending == null) {
+                            Icon(Icons.Filled.WbSunny, "আজকের পরিকল্পনা")
+                        }
+                        IconButton(onClick = { vm.briefingNow("evening") }, enabled = vm.pending == null) {
+                            Icon(Icons.Filled.NightsStay, "আজকের হিসাব")
+                        }
                     }
                     IconButton(onClick = { showSettings = true }) { Icon(Icons.Filled.Settings, "সেটিংস") }
                 },
@@ -145,11 +162,25 @@ fun AppRoot(vm: MainViewModel) {
                 Tab.MEMORY -> MemoryScreen(vm)
                 Tab.LISTS -> ListsScreen(vm)
                 Tab.REMINDERS -> RemindersScreen(vm)
+                Tab.TRACKER -> TrackerScreen(vm)
             }
         }
     }
 
     if (showSettings) SettingsDialog(vm, onDismiss = { showSettings = false })
+
+    // Opened from the "মুখে বলুন" shortcut: go to chat, where listening starts.
+    LaunchedEffect(vm.listenRequested) {
+        if (vm.listenRequested) tab = Tab.CHAT
+    }
+
+    vm.info?.let { message ->
+        AlertDialog(
+            onDismissRequest = { vm.info = null },
+            confirmButton = { TextButton(onClick = { vm.info = null }) { Text("ঠিক আছে") } },
+            text = { Text(message) },
+        )
+    }
 
     vm.error?.let { message ->
         AlertDialog(
@@ -168,7 +199,32 @@ private fun ChatScreen(vm: MainViewModel) {
     val listState = rememberLazyListState()
     val speech = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         val spoken = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()
-        if (!spoken.isNullOrBlank()) input = if (input.isBlank()) spoken else "$input $spoken"
+        if (!spoken.isNullOrBlank()) {
+            val text = if (input.isBlank()) spoken else "$input $spoken"
+            if (vm.settings.autoSendVoice && vm.pending == null) {
+                vm.send(text)
+                input = ""
+            } else {
+                input = text
+            }
+        }
+    }
+    val listen: () -> Unit = {
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+            .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "bn-BD")
+            .putExtra(RecognizerIntent.EXTRA_PROMPT, "বলুন… আমি গুছিয়ে রাখবো")
+        try {
+            speech.launch(intent)
+        } catch (e: ActivityNotFoundException) {
+            vm.error = "এই ফোনে ভয়েস ইনপুট পাওয়া যায়নি। Google অ্যাপ ইনস্টল/আপডেট করে দেখুন।"
+        }
+    }
+    LaunchedEffect(vm.listenRequested) {
+        if (vm.listenRequested) {
+            vm.listenRequested = false
+            listen()
+        }
     }
 
     val pending = vm.pending
@@ -189,7 +245,12 @@ private fun ChatScreen(vm: MainViewModel) {
             if (vm.chats.isEmpty() && pending == null) {
                 item(key = "welcome") { WelcomeCard(vm.settings.ownerName) }
             }
-            items(vm.chats, key = { it.id }) { Bubble(it.text, it.fromUser) }
+            items(vm.chats, key = { it.id }) { message ->
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Bubble(message.text, message.fromUser)
+                    if (message.actions.isNotEmpty()) ActionButtons(message.actions, vm::runAction)
+                }
+            }
             if (pending != null) {
                 item(key = "pending-question") { Bubble(pending, fromUser = true) }
                 item(key = "pending-answer") { ThinkingBubble() }
@@ -202,17 +263,7 @@ private fun ChatScreen(vm: MainViewModel) {
                 .padding(horizontal = 8.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            IconButton(onClick = {
-                val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-                    .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                    .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "bn-BD")
-                    .putExtra(RecognizerIntent.EXTRA_PROMPT, "বলুন…")
-                try {
-                    speech.launch(intent)
-                } catch (e: ActivityNotFoundException) {
-                    vm.error = "এই ফোনে ভয়েস ইনপুট পাওয়া যায়নি। Google অ্যাপ ইনস্টল/আপডেট করে দেখুন।"
-                }
-            }) {
+            IconButton(onClick = { listen() }, enabled = pending == null) {
                 Icon(Icons.Filled.Mic, contentDescription = "মুখে বলুন")
             }
             OutlinedTextField(
@@ -241,13 +292,15 @@ private fun WelcomeCard(name: String) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text("আসসালামু আলাইকুম${if (name.isNotBlank()) " $name" else ""}! 👋", style = MaterialTheme.typography.titleMedium)
-            Text("আমাকে যা বলবেন, আমি গুছিয়ে মনে রাখবো আর সময়মতো মনে করিয়ে দেবো। যেমন:")
+            Text("🎤 মাইকে চেপে যা খুশি বলুন — আমি নিজেই বুঝে নোট, লিস্ট, রিমাইন্ডার, খরচের হিসাব বা অভ্যাসে গুছিয়ে রাখবো। যেমন:")
             listOf(
-                "আমার স্ত্রীর জন্মদিন ১২ মার্চ",
-                "শপিং লিস্টে দুধ, ডিম আর চাল যোগ করো",
-                "প্রতিদিন রাত ১০টায় ওষুধের কথা মনে করাবে",
+                "আমার স্ত্রীর জন্মদিন ১২ মার্চ, প্রতি বছর মনে করাবে",
+                "দুধ, ডিম আর চাল কিনতে হবে",
+                "আজ বাজারে ৮৫০ টাকা খরচ হলো",
+                "প্রতিদিন ফজরের পর হাঁটার অভ্যাস করতে চাই",
                 "কাল সকাল ১১টায় মিটিং, ১ ঘণ্টা আগে মনে করিও",
-                "আজকে আমার কী কী করা উচিত?",
+                "আম্মুকে ফোন দিতে হবে",
+                "এই মাসে কোথায় বেশি খরচ হচ্ছে?",
             ).forEach { Text("• $it", style = MaterialTheme.typography.bodyMedium) }
         }
     }
@@ -457,6 +510,7 @@ private fun ReminderCard(reminder: Reminder, onCancel: () -> Unit) {
                             Repeat.DAILY -> " · প্রতিদিন"
                             Repeat.WEEKLY -> " · প্রতি সপ্তাহে"
                             Repeat.MONTHLY -> " · প্রতি মাসে"
+                            Repeat.YEARLY -> " · প্রতি বছর"
                         },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.primary,
@@ -493,17 +547,147 @@ private fun EmptyHint(text: String) {
     )
 }
 
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun ActionButtons(actions: List<PhoneAction>, onRun: (PhoneAction) -> Unit) {
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        actions.forEach { action ->
+            val icon = when (action.type) {
+                "call" -> "📞"
+                "sms" -> "💬"
+                "whatsapp" -> "🟢"
+                "email" -> "✉️"
+                "map" -> "📍"
+                "calendar" -> "📅"
+                "alarm" -> "⏰"
+                else -> "🔎"
+            }
+            FilledTonalButton(onClick = { onRun(action) }) { Text("$icon ${action.label}") }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- tracker (money + habits)
+
+@Composable
+private fun TrackerScreen(vm: MainViewModel) {
+    val spent = vm.monthExpenses.filter { it.amount > 0 }
+    val received = -vm.monthExpenses.filter { it.amount < 0 }.sumOf { it.amount }
+    val today = java.time.LocalDate.now().toString()
+
+    LazyColumn(
+        Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        item(key = "habits") {
+            SectionCard(title = "আজকের অভ্যাস", count = vm.habits.count { it.doneToday }) {
+                if (vm.habits.isEmpty()) {
+                    Text(
+                        "চ্যাটে বলুন: \"প্রতিদিন নামাজ/হাঁটা/বই পড়ার অভ্যাস ট্র্যাক করো\"",
+                        Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                        color = MaterialTheme.colorScheme.outline,
+                    )
+                }
+                vm.habits.forEach { HabitRowView(it, vm) }
+            }
+        }
+        item(key = "month") {
+            SectionCard(title = "এই মাসের খরচ", count = spent.size) {
+                Column(Modifier.padding(horizontal = 16.dp, vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("মোট খরচ: ৳${money(spent.sumOf { it.amount })}", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.primary)
+                    if (received > 0) Text("আয়/প্রাপ্তি: ৳${money(received)}")
+                    Text("আজ: ৳${money(spent.filter { it.date == today }.sumOf { it.amount })}")
+                    spent.groupBy { it.category }
+                        .mapValues { (_, v) -> v.sumOf { it.amount } }
+                        .entries.sortedByDescending { it.value }
+                        .forEach { (category, total) ->
+                            Row(Modifier.fillMaxWidth()) {
+                                Text(EXPENSE_CATEGORIES[category] ?: category, Modifier.weight(1f))
+                                Text("৳${money(total)}")
+                            }
+                        }
+                }
+            }
+        }
+        if (vm.monthExpenses.isEmpty()) {
+            item { EmptyHint("খরচ লিখতে চ্যাটে বলুন: \"আজ রিকশা ভাড়া ৬০ টাকা\"") }
+        }
+        items(vm.monthExpenses, key = { "expense-${it.id}" }) { ExpenseRow(it, onDelete = { vm.deleteExpense(it) }) }
+    }
+}
+
+@Composable
+private fun HabitRowView(habit: HabitRow, vm: MainViewModel) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Checkbox(checked = habit.doneToday, onCheckedChange = { vm.toggleHabitToday(habit) })
+        Column(Modifier.weight(1f)) {
+            Text(habit.name)
+            Text(
+                "🔥 ${habit.streak} দিন টানা · গত ৭ দিনে ${habit.last7} বার",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.outline,
+            )
+        }
+        IconButton(onClick = { vm.deleteHabit(habit) }) {
+            Icon(Icons.Filled.Delete, contentDescription = "মুছুন", tint = MaterialTheme.colorScheme.outline)
+        }
+    }
+}
+
+@Composable
+private fun ExpenseRow(expense: Expense, onDelete: () -> Unit) {
+    Card(Modifier.fillMaxWidth()) {
+        Row(Modifier.padding(start = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f).padding(vertical = 10.dp)) {
+                Text(expense.note)
+                Text(
+                    "${expense.date} · ${EXPENSE_CATEGORIES[expense.category] ?: expense.category}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.outline,
+                )
+            }
+            Text(
+                (if (expense.amount < 0) "+৳" else "৳") + money(kotlin.math.abs(expense.amount)),
+                color = if (expense.amount < 0) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                fontWeight = FontWeight.SemiBold,
+            )
+            IconButton(onClick = onDelete) {
+                Icon(Icons.Filled.Delete, contentDescription = "মুছুন", tint = MaterialTheme.colorScheme.outline)
+            }
+        }
+    }
+}
+
+private fun money(value: Double): String =
+    if (value % 1.0 == 0.0) "%,d".format(value.toLong()) else "%,.2f".format(value)
+
+// ---------------------------------------------------------------- settings
+
 @Composable
 private fun SettingsDialog(vm: MainViewModel, onDismiss: () -> Unit) {
     var name by rememberSaveable { mutableStateOf(vm.settings.ownerName) }
     var apiKey by rememberSaveable { mutableStateOf(vm.settings.apiKey) }
     var briefing by rememberSaveable { mutableStateOf(vm.settings.briefingTime) }
+    var evening by rememberSaveable { mutableStateOf(vm.settings.eveningTime) }
+    var autoSend by rememberSaveable { mutableStateOf(vm.settings.autoSendVoice) }
+    var speak by rememberSaveable { mutableStateOf(vm.settings.speakReplies) }
+
+    val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        if (uri != null) vm.exportTo(uri)
+    }
+    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) vm.importFrom(uri)
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("সেটিংস") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(
+                Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
                 OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("আপনার নাম") }, singleLine = true)
                 OutlinedTextField(
                     value = apiKey,
@@ -520,9 +704,27 @@ private fun SettingsDialog(vm: MainViewModel, onDismiss: () -> Unit) {
                 OutlinedTextField(
                     value = briefing,
                     onValueChange = { briefing = it },
-                    label = { Text("সকালের ব্রিফিং (HH:MM, ফাঁকা = বন্ধ)") },
+                    label = { Text("সকালের পরিকল্পনা (যেমন 8:00, ফাঁকা = বন্ধ)") },
                     singleLine = true,
                 )
+                OutlinedTextField(
+                    value = evening,
+                    onValueChange = { evening = it },
+                    label = { Text("রাতের হিসাব (যেমন 21:30, ফাঁকা = বন্ধ)") },
+                    singleLine = true,
+                )
+                SwitchRow("মুখে বলা শেষ হলেই পাঠিয়ে দাও", autoSend) { autoSend = it }
+                SwitchRow("উত্তর পড়ে শোনাও", speak) { speak = it }
+                HorizontalDivider()
+                Text("ব্যাকআপ (নতুন ফোনে নিতে বা নিরাপদে রাখতে)", style = MaterialTheme.typography.labelLarge)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilledTonalButton(onClick = { exportLauncher.launch("amar-sohokari-backup-${java.time.LocalDate.now()}.json") }) {
+                        Text("সংরক্ষণ")
+                    }
+                    FilledTonalButton(onClick = { importLauncher.launch(arrayOf("application/json", "text/plain", "*/*")) }) {
+                        Text("ফিরিয়ে আনুন")
+                    }
+                }
                 TextButton(onClick = {
                     vm.clearChat()
                     onDismiss()
@@ -531,10 +733,18 @@ private fun SettingsDialog(vm: MainViewModel, onDismiss: () -> Unit) {
         },
         confirmButton = {
             TextButton(onClick = {
-                vm.saveSettings(name, apiKey, briefing)
+                vm.saveSettings(name, apiKey, briefing, evening, autoSend, speak)
                 onDismiss()
             }) { Text("সংরক্ষণ") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("বাতিল") } },
     )
+}
+
+@Composable
+private fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, Modifier.weight(1f))
+        Switch(checked = checked, onCheckedChange = onChange)
+    }
 }

@@ -1,6 +1,7 @@
 package bd.aiap
 
 import android.Manifest
+import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -24,6 +25,7 @@ class MainActivity : ComponentActivity() {
             notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
         AiApp.from(this).alarms.rescheduleAll()
+        handleShortcut(intent)
         setContent {
             AppTheme {
                 AppRoot(viewModel)
@@ -31,8 +33,21 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleShortcut(intent)
+    }
+
+    private fun handleShortcut(intent: Intent?) {
+        if (intent?.action == VOICE_ACTION) viewModel.listenRequested = true
+    }
+
     override fun onResume() {
         super.onResume()
         viewModel.refresh() // reminders may have fired while we were away
+    }
+
+    companion object {
+        const val VOICE_ACTION = "bd.aiap.VOICE"
     }
 }

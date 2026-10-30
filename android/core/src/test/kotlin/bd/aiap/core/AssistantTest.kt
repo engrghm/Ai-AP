@@ -37,7 +37,23 @@ class InMemoryStore : Store {
     override fun getReminder(id: Long) = reminders.firstOrNull { it.id == id }
     override fun rescheduleReminder(id: Long, dueAtMillis: Long) = reminders.replaceAll { if (it.id == id) it.copy(dueAtMillis = dueAtMillis) else it }
     override fun deactivateReminder(id: Long) = reminders.removeIf { it.id == id }
-    override fun addChat(fromUser: Boolean, text: String) = nextId++.also { chats += ChatMessage(it, fromUser, text, 0) }
+    val expenseList = mutableListOf<Expense>()
+    val habitList = mutableListOf<Habit>()
+    val habitDone = mutableSetOf<Pair<Long, String>>()
+    override fun addExpense(amount: Double, category: String, note: String, date: String) =
+        nextId++.also { expenseList += Expense(it, amount, category, note, date) }
+    override fun expenses(from: String, to: String) = expenseList.filter { it.date in from..to }.sortedByDescending { it.date }
+    override fun deleteExpense(id: Long) = expenseList.removeIf { it.id == id }
+    override fun addHabit(name: String) = nextId++.also { habitList += Habit(it, name) }
+    override fun habits() = habitList.toList()
+    override fun deleteHabit(id: Long) = habitList.removeIf { it.id == id }
+    override fun setHabitDone(habitId: Long, date: String, done: Boolean) {
+        if (done) habitDone += habitId to date else habitDone -= habitId to date
+    }
+    override fun habitDoneDates(habitId: Long, from: String) =
+        habitDone.filter { it.first == habitId && it.second >= from }.map { it.second }.toSet()
+    override fun addChat(fromUser: Boolean, text: String, actions: List<PhoneAction>) =
+        nextId++.also { chats += ChatMessage(it, fromUser, text, 0, actions) }
     override fun recentChats(limit: Int) = chats.takeLast(limit)
 }
 
@@ -62,13 +78,18 @@ class AssistantTest {
         val replies = ArrayDeque(listOf(
             message("tool_use", """[
                 {"type":"tool_use","id":"t1","name":"remember","input":{"category":"Family","content":"স্ত্রীর জন্মদিন ১২ মার্চ"}},
-                {"type":"tool_use","id":"t2","name":"set_reminder","input":{"text":"ওষুধ খান","when":"2026-10-30T22:00","repeat":"daily"}}
+                {"type":"tool_use","id":"t2","name":"set_reminder","input":{"text":"ওষুধ খান","when":"2026-10-30T22:00","repeat":"daily"}},
+                {"type":"tool_use","id":"t3","name":"prepare_phone_action","input":{"type":"call","label":"আম্মুকে কল","target":"01700000000","text":null,"time":null}}
             ]"""),
             message("end_turn", """[{"type":"text","text":"মনে রাখলাম ✅"}]"""),
         ))
         val assistant = Assistant(store, alarms, { requests += it; replies.removeFirst() }, "Masum", zone = { DHAKA }, now = { NOW })
 
-        assertEquals("মনে রাখলাম ✅", assistant.chat("হ্যালো"))
+        val reply = assistant.chat("হ্যালো")
+        assertEquals("মনে রাখলাম ✅", reply.text)
+        assertEquals("01700000000", reply.actions.single().target)
+        assertEquals(reply.actions, store.chats.last().actions)
+        assertEquals(reply.actions, ActionsJson.decode(ActionsJson.encode(reply.actions)))
         assertEquals("family", store.memories.single().category)
         assertEquals(LocalDateTime.of(2026, 10, 30, 22, 0).atZone(DHAKA).toInstant().toEpochMilli(), alarms.scheduled.single().dueAtMillis)
         assertEquals(listOf(true, false), store.chats.map { it.fromUser })
@@ -78,6 +99,7 @@ class AssistantTest {
         assertTrue("\"tool_use_id\":\"t2\"" in body)
         assertTrue("\"fallbacks\":\"default\"" in body)
         assertTrue("\"strict\":true" in body)
+        assertTrue("web_search_20260209" in body)
     }
 
     @Test
@@ -92,5 +114,40 @@ class AssistantTest {
         val jan31 = LocalDateTime.of(2026, 1, 31, 9, 0).atZone(DHAKA).toInstant().toEpochMilli()
         val next = java.time.Instant.ofEpochMilli(nextOccurrence(jan31, Repeat.MONTHLY, DHAKA)).atZone(DHAKA)
         assertEquals(Triple(2, 28, 9), Triple(next.monthValue, next.dayOfMonth, next.hour))
+    }
+
+    @Test
+    fun `expenses habits and backup round trip`() {
+        val store = InMemoryStore()
+        val alarms = RecordingAlarms()
+        val tools = ToolExecutor(store, alarms, { DHAKA }, { NOW })
+        tools.run("add_expense", mapOf("amount" to 500, "category" to "food", "note" to "বাজার", "date" to null))
+        tools.run("add_expense", mapOf("amount" to -40000, "category" to "other", "note" to "বেতন", "date" to "2026-10-01"))
+        val summary = tools.expenseSummary("2026-10-01", "2026-10-30")
+        assertEquals(500.0, summary["total_spent"])
+        assertEquals(40000.0, summary["total_received"])
+        assertEquals("income", store.expenseList.last().category)
+
+        tools.run("add_habit", mapOf("name" to "হাঁটা", "reminder_time" to "06:30"))
+        val habitId = store.habitList.single().id
+        assertEquals(Repeat.DAILY, alarms.scheduled.single().repeat)
+        tools.run("log_habit", mapOf("habit_id" to habitId, "date" to "2026-10-29", "done" to true))
+        tools.run("log_habit", mapOf("habit_id" to habitId, "date" to null, "done" to true))
+        assertEquals(2, tools.habitStatus().single()["streak"])
+
+        val restored = InMemoryStore()
+        val count = Backup.import(Backup.export(store), restored, RecordingAlarms())
+        assertEquals(4, count) // 2 expenses, 1 habit, 1 habit reminder
+        assertEquals(setOf("2026-10-29", "2026-10-30"), restored.habitDoneDates(restored.habitList.single().id, "2000-01-01"))
+    }
+
+    @Test
+    fun `yearly reminder and streak helpers`() {
+        val bday = LocalDateTime.of(2026, 3, 12, 9, 0).atZone(DHAKA).toInstant().toEpochMilli()
+        val next = java.time.Instant.ofEpochMilli(nextFutureOccurrence(bday, Repeat.YEARLY, DHAKA, NOW)).atZone(DHAKA)
+        assertEquals(Triple(2027, 3, 12), Triple(next.year, next.monthValue, next.dayOfMonth))
+        val today = java.time.LocalDate.of(2026, 10, 30)
+        assertEquals(2, streak(setOf("2026-10-28", "2026-10-29"), today))
+        assertEquals(0, streak(setOf("2026-10-27"), today))
     }
 }

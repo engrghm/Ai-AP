@@ -18,6 +18,7 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.Worker
 import androidx.work.WorkerParameters
+import androidx.work.workDataOf
 import bd.aiap.core.AlarmScheduler
 import bd.aiap.core.Reminder
 import bd.aiap.core.Repeat
@@ -28,9 +29,16 @@ import java.time.ZonedDateTime
 
 private const val ACTION_REMINDER = "bd.aiap.REMINDER"
 private const val ACTION_BRIEFING = "bd.aiap.BRIEFING"
+private const val ACTION_EVENING = "bd.aiap.EVENING"
+private const val ACTION_SNOOZE = "bd.aiap.SNOOZE"
+private const val ACTION_DONE = "bd.aiap.DONE"
 private const val EXTRA_ID = "id"
+private const val EXTRA_TEXT = "text"
 private const val BRIEFING_REQUEST_CODE = -1
+private const val EVENING_REQUEST_CODE = -2
 private const val BRIEFING_NOTIFICATION_ID = -1
+private const val EVENING_NOTIFICATION_ID = -2
+private const val SNOOZE_MINUTES = 10L
 
 /** Schedules reminders and the daily briefing with AlarmManager so they fire even when the app is closed. */
 class AndroidAlarms(private val context: Context) : AlarmScheduler {
@@ -38,11 +46,11 @@ class AndroidAlarms(private val context: Context) : AlarmScheduler {
 
     fun canScheduleExact(): Boolean = Build.VERSION.SDK_INT < Build.VERSION_CODES.S || manager.canScheduleExactAlarms()
 
-    private fun pendingIntent(action: String, requestCode: Int, id: Long = 0): PendingIntent =
+    fun pendingIntent(action: String, requestCode: Int, id: Long = 0, text: String? = null): PendingIntent =
         PendingIntent.getBroadcast(
             context,
             requestCode,
-            Intent(context, ReminderReceiver::class.java).setAction(action).putExtra(EXTRA_ID, id),
+            Intent(context, ReminderReceiver::class.java).setAction(action).putExtra(EXTRA_ID, id).putExtra(EXTRA_TEXT, text),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
 
@@ -68,8 +76,12 @@ class AndroidAlarms(private val context: Context) : AlarmScheduler {
     }
 
     /** Next morning briefing at [time] ("HH:MM"); empty turns it off. */
-    fun scheduleBriefing(time: String) {
-        val intent = pendingIntent(ACTION_BRIEFING, BRIEFING_REQUEST_CODE)
+    fun scheduleBriefing(time: String) = scheduleDaily(time, pendingIntent(ACTION_BRIEFING, BRIEFING_REQUEST_CODE))
+
+    /** Next evening review at [time] ("HH:MM"); empty turns it off. */
+    fun scheduleEvening(time: String) = scheduleDaily(time, pendingIntent(ACTION_EVENING, EVENING_REQUEST_CODE))
+
+    private fun scheduleDaily(time: String, intent: PendingIntent) {
         val localTime = runCatching { LocalTime.parse(time) }.getOrNull()
         if (localTime == null) {
             manager.cancel(intent)
@@ -86,11 +98,19 @@ class AndroidAlarms(private val context: Context) : AlarmScheduler {
         val app = AiApp.from(context)
         app.store.activeReminders().forEach(::schedule)
         scheduleBriefing(app.settings.briefingTime)
+        scheduleEvening(app.settings.eveningTime)
     }
 }
 
 object Notifications {
-    fun show(context: Context, id: Int, channel: String, title: String, text: String) {
+    fun show(
+        context: Context,
+        id: Int,
+        channel: String,
+        title: String,
+        text: String,
+        reminderId: Long? = null,
+    ) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) return
@@ -109,6 +129,13 @@ object Notifications {
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setContentIntent(open)
             .setAutoCancel(true)
+            .apply {
+                if (reminderId != null) {
+                    val alarms = AiApp.from(context).alarms
+                    addAction(0, "✅ হয়ে গেছে", alarms.pendingIntent(ACTION_DONE, id, reminderId))
+                    addAction(0, "⏰ $SNOOZE_MINUTES মিনিট পরে", alarms.pendingIntent(ACTION_SNOOZE, id, reminderId, text))
+                }
+            }
             .build()
         NotificationManagerCompat.from(context).notify(id, notification)
     }
@@ -120,7 +147,7 @@ class ReminderReceiver : BroadcastReceiver() {
         when (intent.action) {
             ACTION_REMINDER -> {
                 val reminder = app.store.getReminder(intent.getLongExtra(EXTRA_ID, -1)) ?: return
-                Notifications.show(context, reminder.id.toInt(), AiApp.CHANNEL_REMINDERS, "⏰ রিমাইন্ডার", reminder.text)
+                Notifications.show(context, reminder.id.toInt(), AiApp.CHANNEL_REMINDERS, "⏰ রিমাইন্ডার", reminder.text, reminder.id)
                 if (reminder.repeat == Repeat.NONE) {
                     app.store.deactivateReminder(reminder.id)
                 } else {
@@ -129,12 +156,28 @@ class ReminderReceiver : BroadcastReceiver() {
                     app.alarms.schedule(reminder.copy(dueAtMillis = next))
                 }
             }
-            ACTION_BRIEFING -> {
+            ACTION_DONE -> {
+                NotificationManagerCompat.from(context).cancel(intent.getLongExtra(EXTRA_ID, -1).toInt())
+            }
+            ACTION_SNOOZE -> {
+                val id = intent.getLongExtra(EXTRA_ID, -1)
+                NotificationManagerCompat.from(context).cancel(id.toInt())
+                // The reminder itself may already be finished, so the text travels with the button.
+                val text = intent.getStringExtra(EXTRA_TEXT) ?: return
+                // A one-off copy, so a repeating reminder keeps its own schedule.
+                val at = System.currentTimeMillis() + SNOOZE_MINUTES * 60_000
+                val snoozeId = app.store.addReminder(text, at, Repeat.NONE)
+                app.alarms.schedule(Reminder(snoozeId, text, at, Repeat.NONE))
+            }
+            ACTION_BRIEFING, ACTION_EVENING -> {
+                val evening = intent.action == ACTION_EVENING
                 val request = OneTimeWorkRequestBuilder<BriefingWorker>()
                     .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+                    .setInputData(workDataOf(BriefingWorker.KIND to if (evening) "evening" else "morning"))
                     .build()
-                WorkManager.getInstance(context).enqueueUniqueWork("briefing", ExistingWorkPolicy.REPLACE, request)
-                app.alarms.scheduleBriefing(app.settings.briefingTime)
+                WorkManager.getInstance(context)
+                    .enqueueUniqueWork(if (evening) "evening" else "briefing", ExistingWorkPolicy.REPLACE, request)
+                if (evening) app.alarms.scheduleEvening(app.settings.eveningTime) else app.alarms.scheduleBriefing(app.settings.briefingTime)
             }
         }
     }
@@ -150,15 +193,21 @@ class BootReceiver : BroadcastReceiver() {
 class BriefingWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
     override fun doWork(): Result {
         val assistant = AiApp.from(applicationContext).assistant() ?: return Result.success()
+        val evening = inputData.getString(KIND) == "evening"
         return try {
-            val text = assistant.briefing()
+            val text = assistant.briefing(if (evening) "evening" else "morning")
             if (text.isNotBlank()) {
-                Notifications.show(applicationContext, BRIEFING_NOTIFICATION_ID, AiApp.CHANNEL_BRIEFING, "🌅 আজকের পরিকল্পনা", text)
-                AiApp.from(applicationContext).store.addChat(fromUser = false, text = "🌅 $text")
+                val (id, title) = if (evening) EVENING_NOTIFICATION_ID to "🌙 আজকের হিসাব" else BRIEFING_NOTIFICATION_ID to "🌅 আজকের পরিকল্পনা"
+                Notifications.show(applicationContext, id, AiApp.CHANNEL_BRIEFING, title, text)
+                AiApp.from(applicationContext).store.addChat(fromUser = false, text = "$title\n$text")
             }
             Result.success()
         } catch (e: Exception) {
             if (runAttemptCount < 3) Result.retry() else Result.failure()
         }
+    }
+
+    companion object {
+        const val KIND = "kind"
     }
 }

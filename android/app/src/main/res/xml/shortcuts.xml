@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Long-press the app icon (or add to home screen) to start talking right away. -->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="voice"
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutShortLabel="@string/shortcut_voice"
+        android:shortcutLongLabel="@string/shortcut_voice">
+        <intent
+            android:action="bd.aiap.VOICE"
+            android:targetPackage="bd.aiap"
+            android:targetClass="bd.aiap.MainActivity" />
+    </shortcut>
+</shortcuts>

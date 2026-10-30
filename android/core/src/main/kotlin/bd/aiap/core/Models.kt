@@ -24,7 +24,7 @@ data class Reminder(
 )
 
 enum class Repeat(val key: String) {
-    NONE("none"), DAILY("daily"), WEEKLY("weekly"), MONTHLY("monthly");
+    NONE("none"), DAILY("daily"), WEEKLY("weekly"), MONTHLY("monthly"), YEARLY("yearly");
 
     companion object {
         fun of(key: String): Repeat =
@@ -32,7 +32,40 @@ enum class Repeat(val key: String) {
     }
 }
 
-data class ChatMessage(val id: Long, val fromUser: Boolean, val text: String, val createdAt: Long)
+/** Money spent (or received, when [amount] is negative). [date] is a local YYYY-MM-DD. */
+data class Expense(
+    val id: Long,
+    val amount: Double,
+    val category: String,
+    val note: String,
+    val date: String,
+)
+
+data class Habit(val id: Long, val name: String)
+
+/**
+ * Something the assistant prepared for the owner to do on the phone (call, message, map, ...).
+ * It is shown as a button under the reply and only runs when the owner taps it.
+ */
+data class PhoneAction(
+    val type: String,
+    val label: String,
+    val target: String,
+    val text: String?,
+    val time: String?,
+)
+
+val PHONE_ACTION_TYPES = listOf("call", "sms", "whatsapp", "email", "map", "web", "calendar", "alarm")
+
+data class ChatMessage(
+    val id: Long,
+    val fromUser: Boolean,
+    val text: String,
+    val createdAt: Long,
+    val actions: List<PhoneAction> = emptyList(),
+)
+
+data class ChatReply(val text: String, val actions: List<PhoneAction>)
 
 /** Everything the assistant knows about the owner. The Android app backs this with SQLite. */
 interface Store {
@@ -52,7 +85,20 @@ interface Store {
     fun rescheduleReminder(id: Long, dueAtMillis: Long)
     fun deactivateReminder(id: Long): Boolean
 
-    fun addChat(fromUser: Boolean, text: String): Long
+    fun addExpense(amount: Double, category: String, note: String, date: String): Long
+    /** Expenses with from <= date <= to (inclusive, YYYY-MM-DD), newest first. */
+    fun expenses(from: String, to: String): List<Expense>
+    fun deleteExpense(id: Long): Boolean
+
+    fun addHabit(name: String): Long
+    fun habits(): List<Habit>
+    fun deleteHabit(id: Long): Boolean
+    /** Marks the habit done (or not) on a local date. */
+    fun setHabitDone(habitId: Long, date: String, done: Boolean)
+    /** Dates (YYYY-MM-DD) on or after [from] when the habit was done. */
+    fun habitDoneDates(habitId: Long, from: String): Set<String>
+
+    fun addChat(fromUser: Boolean, text: String, actions: List<PhoneAction> = emptyList()): Long
     fun recentChats(limit: Int): List<ChatMessage>
 }
 

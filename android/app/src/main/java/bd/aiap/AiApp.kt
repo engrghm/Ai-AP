@@ -22,6 +22,21 @@ class Settings(context: Context) {
     var briefingTime: String
         get() = prefs.getString("briefing_time", "08:00") ?: ""
         set(value) = prefs.edit().putString("briefing_time", value.trim()).apply()
+
+    /** "HH:MM", or empty to turn the evening review off. */
+    var eveningTime: String
+        get() = prefs.getString("evening_time", "21:30") ?: ""
+        set(value) = prefs.edit().putString("evening_time", value.trim()).apply()
+
+    /** Send what was spoken straight away, without tapping send. */
+    var autoSendVoice: Boolean
+        get() = prefs.getBoolean("auto_send_voice", true)
+        set(value) = prefs.edit().putBoolean("auto_send_voice", value).apply()
+
+    /** Read replies aloud. */
+    var speakReplies: Boolean
+        get() = prefs.getBoolean("speak_replies", false)
+        set(value) = prefs.edit().putBoolean("speak_replies", value).apply()
 }
 
 class AiApp : Application() {
@@ -31,6 +46,7 @@ class AiApp : Application() {
         private set
     lateinit var alarms: AndroidAlarms
         private set
+    val speaker by lazy { Speaker(this) }
 
     private var assistant: Assistant? = null
     private var assistantKey: Pair<String, String>? = null

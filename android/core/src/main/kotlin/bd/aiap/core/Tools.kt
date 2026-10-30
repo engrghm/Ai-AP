@@ -23,7 +23,24 @@ val MEMORY_CATEGORIES = linkedMapOf(
     "notes" to "নোট",
 )
 
+/** Spending categories with Bangla names for the tracker screen. */
+val EXPENSE_CATEGORIES = linkedMapOf(
+    "food" to "খাবার ও বাজার",
+    "transport" to "যাতায়াত",
+    "bills" to "বিল (বিদ্যুৎ, গ্যাস, নেট, মোবাইল)",
+    "rent" to "বাসা ভাড়া",
+    "shopping" to "কেনাকাটা",
+    "health" to "চিকিৎসা",
+    "education" to "পড়াশোনা",
+    "family" to "পরিবার",
+    "charity" to "দান-সদকা",
+    "income" to "আয়",
+    "other" to "অন্যান্য",
+)
+
 private val STR = mapOf("type" to "string")
+private val NUM = mapOf("type" to "number")
+private val BOOL = mapOf("type" to "boolean")
 private val OPT_STR = mapOf("type" to listOf("string", "null"))
 private val INT = mapOf("type" to "integer")
 
@@ -93,6 +110,55 @@ val TOOL_DEFINITIONS: List<BetaTool> = listOf(
     ),
     tool("get_reminders", "List all active reminders.", emptyMap()),
     tool("cancel_reminder", "Cancel an active reminder by id.", mapOf("reminder_id" to INT)),
+    tool(
+        "add_expense",
+        "Record money the owner spent or received (e.g. 'bazar e 500 taka khoroch', 'salary pelam 40000'). " +
+            "Use a positive amount for spending and a negative amount for money received.",
+        mapOf(
+            "amount" to described(NUM, "Amount in taka; negative for income/received"),
+            "category" to described(STR, "One of: ${EXPENSE_CATEGORIES.keys.joinToString()}"),
+            "note" to described(STR, "Short description, in the owner's language"),
+            "date" to described(OPT_STR, "Local date YYYY-MM-DD; null for today"),
+        ),
+    ),
+    tool(
+        "get_expenses",
+        "Get spending between two dates with totals per category. Nulls mean the current month so far.",
+        mapOf("from_date" to OPT_STR, "to_date" to OPT_STR),
+    ),
+    tool("delete_expense", "Delete a recorded expense by id.", mapOf("expense_id" to INT)),
+    tool(
+        "add_habit",
+        "Start tracking a daily habit (prayer, exercise, reading, water, ...). Optionally also set a daily reminder.",
+        mapOf(
+            "name" to described(STR, "Short habit name in the owner's language"),
+            "reminder_time" to described(OPT_STR, "Optional daily reminder time HH:MM"),
+        ),
+    ),
+    tool(
+        "log_habit",
+        "Mark a habit as done (or not done) for a day, when the owner says they did it.",
+        mapOf("habit_id" to INT, "date" to described(OPT_STR, "YYYY-MM-DD; null for today"), "done" to BOOL),
+    ),
+    tool("get_habits", "List habits with today's status and current streak.", emptyMap()),
+    tool("delete_habit", "Stop tracking a habit.", mapOf("habit_id" to INT)),
+    tool(
+        "prepare_phone_action",
+        "Prepare a button the owner can tap to do something on the phone: call or message someone, " +
+            "send WhatsApp/email, open a place in maps, search the web, add a calendar event or set an alarm. " +
+            "Look up phone numbers and emails in memory first. Nothing happens until the owner taps it.",
+        mapOf(
+            "type" to mapOf("type" to "string", "enum" to PHONE_ACTION_TYPES),
+            "label" to described(STR, "Button text in the owner's language, e.g. 'আম্মুকে কল করুন'"),
+            "target" to described(
+                STR,
+                "Phone number for call/sms/whatsapp, email address, place for map, search text for web, " +
+                    "event title for calendar, alarm label for alarm",
+            ),
+            "text" to described(OPT_STR, "Message body for sms/whatsapp/email, or event details"),
+            "time" to described(OPT_STR, "Local YYYY-MM-DDTHH:MM for calendar or alarm, else null"),
+        ),
+    ),
 )
 
 class ToolExecutor(
@@ -103,6 +169,12 @@ class ToolExecutor(
 ) {
     private val json = ObjectMapper()
     private val display = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm (EEE)")
+    private val actions = mutableListOf<PhoneAction>()
+
+    fun today(): LocalDate = Instant.ofEpochMilli(now()).atZone(zone()).toLocalDate()
+
+    /** Phone actions prepared during this turn, handed to the UI with the reply. */
+    fun takeActions(): List<PhoneAction> = actions.toList().also { actions.clear() }
 
     fun formatLocal(millis: Long): String = Instant.ofEpochMilli(millis).atZone(zone()).format(display)
 
@@ -111,6 +183,7 @@ class ToolExecutor(
         fun str(key: String): String = input[key] as? String ?: throw IllegalArgumentException("$key is required")
         fun optStr(key: String): String? = (input[key] as? String)?.takeIf { it.isNotBlank() }
         fun long(key: String): Long = (input[key] as? Number)?.toLong() ?: throw IllegalArgumentException("$key must be an integer")
+        fun date(key: String): String = optStr(key)?.also { LocalDate.parse(it) } ?: today().toString()
 
         val result: Any = when (name) {
             "remember" -> mapOf("saved_memory_id" to store.addMemory(str("category").trim().lowercase(), str("content")))
@@ -147,9 +220,73 @@ class ToolExecutor(
                 alarms.cancel(id)
                 mapOf("cancelled" to store.deactivateReminder(id))
             }
+            "add_expense" -> {
+                val amount = (input["amount"] as? Number)?.toDouble() ?: throw IllegalArgumentException("amount must be a number")
+                val category = str("category").trim().lowercase().let { if (it in EXPENSE_CATEGORIES) it else "other" }
+                val id = store.addExpense(amount, if (amount < 0) "income" else category, str("note"), date("date"))
+                mapOf("expense_id" to id, "month_so_far" to expenseSummary(today().withDayOfMonth(1).toString(), today().toString())["total_spent"])
+            }
+            "get_expenses" -> expenseSummary(
+                optStr("from_date")?.also { LocalDate.parse(it) } ?: today().withDayOfMonth(1).toString(),
+                optStr("to_date")?.also { LocalDate.parse(it) } ?: today().toString(),
+            )
+            "delete_expense" -> mapOf("deleted" to store.deleteExpense(long("expense_id")))
+            "add_habit" -> {
+                val habitName = str("name")
+                val id = store.addHabit(habitName)
+                val time = optStr("reminder_time")
+                val reminder = time?.let {
+                    val at = today().atTime(java.time.LocalTime.parse(it)).toString()
+                    setReminder("✅ $habitName", at, Repeat.DAILY)
+                }
+                mapOf("habit_id" to id, "daily_reminder" to reminder)
+            }
+            "log_habit" -> {
+                val id = long("habit_id")
+                require(store.habits().any { it.id == id }) { "No habit with id $id" }
+                store.setHabitDone(id, date("date"), input["done"] != false)
+                mapOf("ok" to true, "streak" to streak(store.habitDoneDates(id, today().minusDays(400).toString()), today()))
+            }
+            "get_habits" -> mapOf("habits" to habitStatus())
+            "delete_habit" -> mapOf("deleted" to store.deleteHabit(long("habit_id")))
+            "prepare_phone_action" -> {
+                val type = str("type")
+                require(type in PHONE_ACTION_TYPES) { "type must be one of $PHONE_ACTION_TYPES" }
+                val time = optStr("time")?.also { LocalDateTime.parse(it.take(16)) }
+                require(type !in setOf("calendar", "alarm") || time != null) { "time is required for $type" }
+                actions += PhoneAction(type, str("label"), str("target"), optStr("text"), time?.take(16))
+                mapOf("prepared" to true, "note" to "A button was added under your reply; the owner must tap it.")
+            }
             else -> throw IllegalArgumentException("Unknown tool: $name")
         }
         return json.writeValueAsString(result)
+    }
+
+    fun expenseSummary(from: String, to: String): Map<String, Any> {
+        val list = store.expenses(from, to)
+        val spent = list.filter { it.amount > 0 }
+        return mapOf(
+            "from" to from,
+            "to" to to,
+            "total_spent" to spent.sumOf { it.amount },
+            "total_received" to -list.filter { it.amount < 0 }.sumOf { it.amount },
+            "by_category" to spent.groupBy { it.category }.mapValues { (_, v) -> v.sumOf { it.amount } },
+            "items" to list.take(100).map { mapOf("id" to it.id, "date" to it.date, "amount" to it.amount, "category" to it.category, "note" to it.note) },
+        )
+    }
+
+    fun habitStatus(): List<Map<String, Any>> {
+        val today = today()
+        return store.habits().map { habit ->
+            val done = store.habitDoneDates(habit.id, today.minusDays(400).toString())
+            mapOf(
+                "id" to habit.id,
+                "name" to habit.name,
+                "done_today" to (today.toString() in done),
+                "streak" to streak(done, today),
+                "last_7_days" to (0L..6L).count { today.minusDays(it).toString() in done },
+            )
+        }
     }
 
     private fun setReminder(text: String, `when`: String, repeat: Repeat): Map<String, Any> {

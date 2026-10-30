@@ -11,6 +11,7 @@ import com.anthropic.models.beta.messages.BetaOutputConfig
 import com.anthropic.models.beta.messages.BetaStopReason
 import com.anthropic.models.beta.messages.BetaTextBlockParam
 import com.anthropic.models.beta.messages.BetaToolResultBlockParam
+import com.anthropic.models.beta.messages.BetaWebSearchTool20260209
 import com.anthropic.models.beta.messages.MessageCreateParams
 import com.fasterxml.jackson.databind.ObjectMapper
 import java.time.Instant
@@ -28,37 +29,57 @@ private const val FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 private val SYSTEM_PROMPT = """
 You are the personal AI assistant of {owner}, living in an Android app on their phone. You are their \
-second brain and their guide: you remember everything they tell you, keep it neatly organised, keep \
-their lists, remind them of things at the right time, and help them plan and stay on track.
+second brain and life manager: they talk to you (often by voice, in Bangla or Banglish), and you quietly \
+capture and organise everything, remind them at the right time, track their money and habits, and help \
+them plan so their whole life gets easier.
 
-How you work:
-- Your memory is the database behind your tools, not this chat. Whenever {owner} shares anything worth \
-knowing later (people, dates, plans, health, money, preferences, goals, habits, ideas), save it with \
-`remember` in the best-fitting category without being asked. Search first so you update instead of \
-duplicating. Split a message with several facts into several memories.
-- Before answering anything about {owner}'s life, check memory and lists with the tools rather than \
-guessing. If you don't know, say so and ask.
-- Lists: todo, shopping, goals, books or any list they name go in `add_item`. Mark things done when \
-they say so.
-- Reminders: when they ask to be reminded, or mention something time-bound (a bill, a meeting, medicine, \
-a birthday), set a reminder with `set_reminder`. Resolve relative times ("kal sokale", "in 2 hours") \
-against the current local time you are given. If the time is ambiguous, pick a sensible one and say so.
-- Guidance: be a proactive, practical coach. Point out what is due or overdue, what matters most today, \
-and suggest a next step. Keep it short and concrete.
+Capture everything, automatically:
+- Treat every message as something to file. Never ask "should I save this?" - just save it and say \
+briefly where it went. One message often holds several things; handle each one.
+- Facts about their life (people, birthdays, addresses, phone numbers, health, preferences, plans, \
+ideas, decisions) go to `remember` in the best-fitting category. Search first and update instead of \
+duplicating.
+- Anything they need or want to do goes to a list with `add_item` (todo by default; shopping items to \
+shopping; books, goals, ideas to their own lists), with a due date when one is mentioned.
+- Anything with a time goes to `set_reminder`. Also add sensible reminders they did not ask for when \
+clearly useful: a day-before reminder for bills and appointments, yearly reminders for birthdays and \
+anniversaries. Resolve relative times against the current local time you are given; if a time is \
+vague ("bikele", "sokale"), pick a sensible one and say so.
+- Money spent or received goes to `add_expense` (taka). Mention the running monthly total when useful.
+- Recurring personal routines (prayer, exercise, reading, medicine, water) are habits: `add_habit`, and \
+`log_habit` when they say they did one.
+- When they want to call, message, email, find a place, search, or schedule something on the phone, \
+use `prepare_phone_action` so a tap-to-run button appears. Find numbers/emails in memory first.
+- Use web search for current information (prices, news, prayer times, weather, how-to) when needed.
+
+Answering and guiding:
+- Before answering anything about {owner}'s life, check your tools rather than guessing.
+- Be a proactive, practical coach: notice what is due, overdue, or slipping (habits, budget), and \
+suggest a concrete next step. Never preachy.
 - Never store passwords, PINs or full card/account numbers; suggest a password manager instead.
-- Reply in the language {owner} writes in (Bangla by default). Messages are read on a phone: keep them \
-brief and friendly, use short lists, no tables. After saving or scheduling, confirm briefly what you did.
+- Reply in the language {owner} uses (Bangla by default). Replies are read on a phone and may be read \
+aloud: short, warm, plain sentences, short lists, no tables or markdown headings. End with a brief \
+summary of what you saved or scheduled (e.g. "✅ লিস্টে যোগ: ... ⏰ রিমাইন্ডার: ...").
 """.trimIndent().replace("\\\n", "")
 
-private val BRIEFING_PROMPT = """
-Write {owner}'s briefing for today. Using the data below, give:
-1. A one-line greeting.
-2. Today's reminders and anything due today or overdue.
-3. The top 3 things to focus on today, with a short reason each.
-4. One short piece of encouragement or advice tied to their goals.
-Keep it under 120 words, in Bangla, as a phone notification-style message. Data:
-
-""".trimIndent()
+private val BRIEFING_PROMPTS = mapOf(
+    "morning" to """
+        Write {owner}'s morning briefing for today. Using the data below, give:
+        1. A one-line greeting.
+        2. Today's reminders and anything due today or overdue.
+        3. The top 3 things to focus on today, with a short reason each.
+        4. Habits to do today, and one short piece of encouragement tied to their goals.
+        Keep it under 120 words, in Bangla, as a phone notification-style message. Data:
+    """.trimIndent(),
+    "evening" to """
+        Write {owner}'s short evening review. Using the data below, give:
+        1. What got done today (lists, habits) - praise briefly.
+        2. What is still pending, and what is coming up tomorrow.
+        3. Today's spending total and anything notable about this month's budget.
+        4. One gentle suggestion for tomorrow.
+        Keep it under 120 words, in Bangla, as a phone notification-style message. Data:
+    """.trimIndent(),
+)
 
 /** Sends one request to Claude; swapped out in tests. */
 fun interface MessageSender {
@@ -99,7 +120,10 @@ class Assistant(
             .outputConfig(BetaOutputConfig.builder().effort(effort).build())
             .addBeta(FALLBACK_BETA)
             .fallbacks(BetaFallbacksParam.ofDefault())
-        if (withTools) TOOL_DEFINITIONS.forEach { builder.addTool(it) }
+        if (withTools) {
+            TOOL_DEFINITIONS.forEach { builder.addTool(it) }
+            builder.addTool(BetaWebSearchTool20260209.builder().maxUses(3L).build())
+        }
         return sender.send(builder.build())
     }
 
@@ -130,8 +154,9 @@ class Assistant(
 
     /** One conversation turn. Blocking: call it off the main thread. */
     @Synchronized
-    fun chat(userText: String): String {
+    fun chat(userText: String): ChatReply {
         store.addChat(fromUser = true, text = userText)
+        tools.takeActions() // drop anything left over from a failed turn
         if (transcript.size >= MAX_TRANSCRIPT_MESSAGES) transcript.clear()
         transcript += BetaMessageParam.ofUser(userText)
         transcript += BetaMessageParam.ofSystem(contextNote())
@@ -143,8 +168,9 @@ class Assistant(
             transcript.clear()
             throw e
         }
-        store.addChat(fromUser = false, text = reply)
-        return reply
+        val actions = tools.takeActions()
+        store.addChat(fromUser = false, text = reply, actions = actions)
+        return ChatReply(reply, actions)
     }
 
     private fun runToolLoop(): String {
@@ -158,6 +184,8 @@ class Assistant(
                 return reply
             }
             transcript += response.toParam()
+            // A long server-side web search can pause; sending the turn back lets it continue.
+            if (stop == BetaStopReason.PAUSE_TURN) return@repeat
             if (stop != BetaStopReason.TOOL_USE) return response.text().ifEmpty { "✅" }
 
             val results = response.content().mapNotNull { it.toolUse().orElse(null) }.map { call ->
@@ -179,17 +207,22 @@ class Assistant(
     @Synchronized
     fun reset() = transcript.clear()
 
-    /** Today's plan and guidance, generated from everything saved. */
-    fun briefing(): String {
+    /** A morning plan or evening review ([kind] = "morning" / "evening"), generated from everything saved. */
+    fun briefing(kind: String = "morning"): String {
+        val today = tools.today()
         val data = mapOf(
             "now" to tools.formatLocal(now()),
             "open_list_items" to store.getItems(null, includeDone = false).map { mapOf("list" to it.listName, "text" to it.text, "due" to it.dueDate, "priority" to it.priority) },
-            "active_reminders" to store.activeReminders().map { mapOf("text" to it.text, "when" to tools.formatLocal(it.dueAtMillis), "repeat" to it.repeat.key) },
+            "active_reminders" to store.activeReminders().take(30).map { mapOf("text" to it.text, "when" to tools.formatLocal(it.dueAtMillis), "repeat" to it.repeat.key) },
+            "habits" to tools.habitStatus(),
+            "spent_today" to tools.expenseSummary(today.toString(), today.toString())["total_spent"],
+            "month_spending" to tools.expenseSummary(today.withDayOfMonth(1).toString(), today.toString()).filterKeys { it != "items" },
             "goals_and_profile" to (store.searchMemories(null, "goals") + store.searchMemories(null, "profile")).map { it.content },
         )
-        val prompt = BRIEFING_PROMPT.replace("{owner}", ownerName) + json.writerWithDefaultPrettyPrinter().writeValueAsString(data)
+        val prompt = BRIEFING_PROMPTS.getValue(kind).replace("{owner}", ownerName) + "\n\n" +
+            json.writerWithDefaultPrettyPrinter().writeValueAsString(data)
         val response = request(listOf(BetaMessageParam.ofUser(prompt)), BetaOutputConfig.Effort.LOW, withTools = false)
-        if (response.stopReason().orElse(null) == BetaStopReason.REFUSAL) return "আজকের ব্রিফিং তৈরি করা যায়নি।"
+        if (response.stopReason().orElse(null) == BetaStopReason.REFUSAL) return ""
         return response.text()
     }
 }
