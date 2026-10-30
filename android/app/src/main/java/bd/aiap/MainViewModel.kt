@@ -150,6 +150,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun stopSpeaking() = app.stopSpeaking()
+
     fun runAction(action: PhoneAction) {
         PhoneActions.run(app, action)?.let { error = it }
     }

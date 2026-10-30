@@ -31,6 +31,40 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
+import bd.aiap.VoiceListener
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.togetherWith
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.keyframes
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
+import androidx.compose.material3.SuggestionChip
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AccountBalanceWallet
@@ -125,7 +159,15 @@ fun AppRoot(vm: MainViewModel) {
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(tab.title) },
+                modifier = Modifier.background(
+                    Brush.horizontalGradient(listOf(MaterialTheme.colorScheme.primary, MaterialTheme.colorScheme.tertiary))
+                ),
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = Color.Transparent,
+                    titleContentColor = Color.White,
+                    actionIconContentColor = Color.White,
+                ),
+                title = { Text(tab.title, fontWeight = FontWeight.Bold) },
                 actions = {
                     if (tab == Tab.CHAT) {
                         IconButton(onClick = { vm.briefingNow("morning") }, enabled = vm.pending == null) {
@@ -159,12 +201,14 @@ fun AppRoot(vm: MainViewModel) {
                 .consumeWindowInsets(padding)
                 .imePadding()
         ) {
-            when (tab) {
-                Tab.CHAT -> ChatScreen(vm)
-                Tab.MEMORY -> MemoryScreen(vm)
-                Tab.LISTS -> ListsScreen(vm)
-                Tab.REMINDERS -> RemindersScreen(vm)
-                Tab.TRACKER -> TrackerScreen(vm)
+            Crossfade(targetState = tab, animationSpec = tween(250), label = "tab") { current ->
+                when (current) {
+                    Tab.CHAT -> ChatScreen(vm)
+                    Tab.MEMORY -> MemoryScreen(vm)
+                    Tab.LISTS -> ListsScreen(vm)
+                    Tab.REMINDERS -> RemindersScreen(vm)
+                    Tab.TRACKER -> TrackerScreen(vm)
+                }
             }
         }
     }
@@ -199,28 +243,50 @@ fun AppRoot(vm: MainViewModel) {
 private fun ChatScreen(vm: MainViewModel) {
     var input by rememberSaveable { mutableStateOf("") }
     val listState = rememberLazyListState()
-    val speech = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-        val spoken = result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()
-        if (!spoken.isNullOrBlank()) {
-            val text = if (input.isBlank()) spoken else "$input $spoken"
-            if (vm.settings.autoSendVoice && vm.pending == null) {
-                vm.send(text)
-                // Keep the words if sending did not start (e.g. no API key yet).
-                input = if (vm.pending != null) "" else text
-            } else {
-                input = text
-            }
+    val context = LocalContext.current
+    val pending = vm.pending
+
+    // What to do with finished speech: send it, or put it in the box to edit.
+    val onSpoken: (String) -> Unit = { spoken ->
+        val text = if (input.isBlank()) spoken else "$input $spoken"
+        if (vm.settings.autoSendVoice && vm.pending == null) {
+            vm.send(text)
+            // Keep the words if sending did not start (e.g. no API key yet).
+            input = if (vm.pending != null) "" else text
+        } else {
+            input = text
         }
     }
+
+    // In-app listening that keeps going through pauses; the system dialog is only a fallback.
+    val voice = remember {
+        if (VoiceListener.isAvailable(context)) VoiceListener(context, { onSpoken(it) }, { vm.error = it }) else null
+    }
+    DisposableEffect(voice) { onDispose { voice?.destroy() } }
+
+    val systemSpeech = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        result.data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()
+            ?.takeIf { it.isNotBlank() }?.let(onSpoken)
+    }
+    val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) voice?.start() else vm.error = "মুখে বলতে মাইক্রোফোনের অনুমতি দরকার।"
+    }
     val listen: () -> Unit = {
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-            .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "bn-BD")
-            .putExtra(RecognizerIntent.EXTRA_PROMPT, "বলুন… আমি গুছিয়ে রাখবো")
-        try {
-            speech.launch(intent)
-        } catch (e: ActivityNotFoundException) {
-            vm.error = "এই ফোনে ভয়েস ইনপুট পাওয়া যায়নি। Google অ্যাপ ইনস্টল/আপডেট করে দেখুন।"
+        vm.stopSpeaking()
+        if (voice != null) {
+            val granted = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+            if (granted) voice.start() else micPermission.launch(Manifest.permission.RECORD_AUDIO)
+        } else {
+            try {
+                systemSpeech.launch(
+                    Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                        .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                        .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "bn-BD")
+                        .putExtra(RecognizerIntent.EXTRA_PROMPT, "বলুন… আমি গুছিয়ে রাখবো")
+                )
+            } catch (e: ActivityNotFoundException) {
+                vm.error = "এই ফোনে ভয়েস ইনপুট পাওয়া যায়নি। Google অ্যাপ ইনস্টল/আপডেট করে দেখুন।"
+            }
         }
     }
     LaunchedEffect(vm.listenRequested) {
@@ -230,7 +296,6 @@ private fun ChatScreen(vm: MainViewModel) {
         }
     }
 
-    val pending = vm.pending
     val rowCount = vm.chats.size + (if (pending != null) 2 else 0)
     LaunchedEffect(rowCount) {
         if (rowCount > 0) listState.animateScrollToItem(rowCount - 1)
@@ -242,99 +307,284 @@ private fun ChatScreen(vm: MainViewModel) {
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth(),
-            contentPadding = PaddingValues(12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             if (vm.chats.isEmpty() && pending == null) {
-                item(key = "welcome") { WelcomeCard(vm.settings.ownerName) }
+                item(key = "welcome") {
+                    WelcomeCard(vm.settings.ownerName, onExample = { vm.send(it) })
+                }
             }
             items(vm.chats, key = { it.id }) { message ->
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Column(Modifier.animateItem(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Bubble(message.text, message.fromUser)
                     if (message.actions.isNotEmpty()) ActionButtons(message.actions, vm::runAction)
                 }
             }
             if (pending != null) {
-                item(key = "pending-question") { Bubble(pending, fromUser = true) }
-                item(key = "pending-answer") { ThinkingBubble() }
+                item(key = "pending-question") { Box(Modifier.animateItem()) { Bubble(pending, fromUser = true) } }
+                item(key = "pending-answer") { Box(Modifier.animateItem()) { ThinkingBubble() } }
             }
         }
 
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 8.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            IconButton(onClick = { listen() }, enabled = pending == null) {
-                Icon(Icons.Filled.Mic, contentDescription = "মুখে বলুন")
-            }
-            OutlinedTextField(
-                value = input,
-                onValueChange = { input = it },
-                modifier = Modifier.weight(1f),
-                placeholder = { Text("লিখুন বা মাইকে বলুন…") },
-                maxLines = 5,
-                shape = RoundedCornerShape(24.dp),
-            )
-            IconButton(
-                onClick = {
-                    vm.send(input)
-                    if (vm.pending != null) input = ""
-                },
-                enabled = input.isNotBlank() && pending == null,
-            ) {
-                Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "পাঠান")
+        AnimatedContent(
+            targetState = voice?.active == true,
+            transitionSpec = {
+                (fadeIn(tween(220)) + slideInVertically { it / 2 }) togetherWith (fadeOut(tween(160)) + slideOutVertically { it / 2 })
+            },
+            label = "input",
+        ) { listening ->
+            if (listening && voice != null) {
+                ListeningPanel(voice)
+            } else {
+                InputBar(
+                    input = input,
+                    onInput = { input = it },
+                    busy = pending != null,
+                    onMic = listen,
+                    onSend = {
+                        vm.send(input)
+                        if (vm.pending != null) input = ""
+                    },
+                )
             }
         }
     }
 }
 
 @Composable
-private fun WelcomeCard(name: String) {
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text("আসসালামু আলাইকুম${if (name.isNotBlank()) " $name" else ""}! 👋", style = MaterialTheme.typography.titleMedium)
-            Text("🎤 মাইকে চেপে যা খুশি বলুন — আমি নিজেই বুঝে নোট, লিস্ট, রিমাইন্ডার, খরচের হিসাব বা অভ্যাসে গুছিয়ে রাখবো। যেমন:")
-            listOf(
-                "আমার স্ত্রীর জন্মদিন ১২ মার্চ, প্রতি বছর মনে করাবে",
-                "দুধ, ডিম আর চাল কিনতে হবে",
-                "আজ বাজারে ৮৫০ টাকা খরচ হলো",
-                "প্রতিদিন ফজরের পর হাঁটার অভ্যাস করতে চাই",
-                "কাল সকাল ১১টায় মিটিং, ১ ঘণ্টা আগে মনে করিও",
-                "আম্মুকে ফোন দিতে হবে",
-                "এই মাসে কোথায় বেশি খরচ হচ্ছে?",
-            ).forEach { Text("• $it", style = MaterialTheme.typography.bodyMedium) }
+private fun InputBar(input: String, onInput: (String) -> Unit, busy: Boolean, onMic: () -> Unit, onSend: () -> Unit) {
+    Surface(tonalElevation = 3.dp, shadowElevation = 6.dp) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            OutlinedTextField(
+                value = input,
+                onValueChange = onInput,
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("লিখুন, অথবা মাইকে চেপে বলুন…") },
+                maxLines = 5,
+                shape = RoundedCornerShape(26.dp),
+            )
+            // One round button: mic when the box is empty, send when there is text (like popular chat apps).
+            val showSend = input.isNotBlank()
+            GradientCircleButton(
+                onClick = { if (showSend) onSend() else onMic() },
+                enabled = !busy,
+            ) {
+                Crossfade(targetState = showSend, label = "micOrSend") { send ->
+                    Icon(
+                        if (send) Icons.AutoMirrored.Filled.Send else Icons.Filled.Mic,
+                        contentDescription = if (send) "পাঠান" else "মুখে বলুন",
+                        tint = Color.White,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GradientCircleButton(onClick: () -> Unit, enabled: Boolean, size: Dp = 52.dp, content: @Composable () -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    Box(
+        Modifier
+            .size(size)
+            .clip(CircleShape)
+            .background(
+                if (enabled) Brush.linearGradient(listOf(colors.primary, colors.tertiary))
+                else Brush.linearGradient(listOf(colors.outline, colors.outline))
+            )
+            .clickable(enabled = enabled, onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) { content() }
+}
+
+/** Shown while listening: a mic that pulses with your voice and the words as they are recognised. */
+@Composable
+private fun ListeningPanel(voice: VoiceListener) {
+    val colors = MaterialTheme.colorScheme
+    val pulse = rememberInfiniteTransition(label = "pulse")
+    val ring by pulse.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(1400, easing = LinearEasing), RepeatMode.Restart),
+        label = "ring",
+    )
+    val loud by animateFloatAsState(voice.level, tween(120), label = "level")
+
+    Surface(tonalElevation = 6.dp, shadowElevation = 12.dp, shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .padding(20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Text("শুনছি… থামলেও শুনতে থাকবো", style = MaterialTheme.typography.labelLarge, color = colors.primary)
+            val heard = voice.text
+            Text(
+                heard.ifBlank { "বলুন, যত লম্বা খুশি…" },
+                Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp, max = 160.dp)
+                    .verticalScroll(rememberScrollState(), reverseScrolling = true),
+                style = MaterialTheme.typography.bodyLarge,
+                color = if (heard.isBlank()) colors.outline else colors.onSurface,
+                textAlign = TextAlign.Center,
+            )
+            Box(Modifier.size(120.dp), contentAlignment = Alignment.Center) {
+                // Two expanding rings plus a glow that follows the loudness of the voice.
+                listOf(ring, (ring + 0.5f) % 1f).forEach { t ->
+                    Box(
+                        Modifier
+                            .size(120.dp)
+                            .scale(0.55f + 0.45f * t)
+                            .alpha(0.35f * (1f - t))
+                            .clip(CircleShape)
+                            .background(colors.primary)
+                    )
+                }
+                Box(
+                    Modifier
+                        .size(80.dp)
+                        .scale(1f + 0.25f * loud)
+                        .clip(CircleShape)
+                        .background(colors.primary.copy(alpha = 0.25f))
+                )
+                GradientCircleButton(onClick = { voice.stop() }, enabled = true, size = 68.dp) {
+                    Icon(Icons.Filled.Mic, contentDescription = "শেষ করুন", tint = Color.White, modifier = Modifier.size(32.dp))
+                }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                TextButton(onClick = { voice.cancel() }) { Text("বাতিল") }
+                Button(onClick = { voice.stop() }) { Text("শেষ ✓") }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun WelcomeCard(name: String, onExample: (String) -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    Card(
+        Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.Transparent),
+    ) {
+        Column(
+            Modifier
+                .background(Brush.linearGradient(listOf(colors.primaryContainer, colors.tertiaryContainer)))
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                "আসসালামু আলাইকুম${if (name.isNotBlank()) " $name" else ""}! 👋",
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold,
+            )
+            Text("🎤 মাইকে চেপে যা খুশি বলুন। আমি নিজেই বুঝে নোট, লিস্ট, রিমাইন্ডার, খরচ বা অভ্যাসে গুছিয়ে রাখবো।")
+            Text("একটা চেপে দেখুন:", style = MaterialTheme.typography.labelLarge)
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                listOf(
+                    "আজকে আমার কী কী করা উচিত?",
+                    "দুধ, ডিম আর চাল কিনতে হবে",
+                    "আজ বাজারে ৮৫০ টাকা খরচ হলো",
+                    "প্রতিদিন রাত ১০টায় ওষুধের কথা মনে করাবে",
+                    "এই মাসে কোথায় বেশি খরচ হচ্ছে?",
+                ).forEach { example ->
+                    SuggestionChip(onClick = { onExample(example) }, label = { Text(example) })
+                }
+            }
         }
     }
 }
 
 @Composable
 private fun Bubble(text: String, fromUser: Boolean) {
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = if (fromUser) Arrangement.End else Arrangement.Start) {
-        Surface(
-            shape = RoundedCornerShape(
-                topStart = 18.dp,
-                topEnd = 18.dp,
-                bottomStart = if (fromUser) 18.dp else 4.dp,
-                bottomEnd = if (fromUser) 4.dp else 18.dp,
-            ),
-            color = if (fromUser) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
-            modifier = Modifier.widthIn(max = 310.dp),
+    val colors = MaterialTheme.colorScheme
+    val shape = RoundedCornerShape(
+        topStart = 20.dp,
+        topEnd = 20.dp,
+        bottomStart = if (fromUser) 20.dp else 6.dp,
+        bottomEnd = if (fromUser) 6.dp else 20.dp,
+    )
+    Row(
+        Modifier.fillMaxWidth(),
+        horizontalArrangement = if (fromUser) Arrangement.End else Arrangement.Start,
+        verticalAlignment = Alignment.Bottom,
+    ) {
+        if (!fromUser) {
+            Box(
+                Modifier
+                    .padding(end = 6.dp)
+                    .size(30.dp)
+                    .clip(CircleShape)
+                    .background(Brush.linearGradient(listOf(colors.primary, colors.tertiary))),
+                contentAlignment = Alignment.Center,
+            ) { Text("✨", style = MaterialTheme.typography.labelMedium) }
+        }
+        Box(
+            Modifier
+                .widthIn(max = 300.dp)
+                .shadow(if (fromUser) 2.dp else 0.dp, shape)
+                .clip(shape)
+                .background(
+                    if (fromUser) Brush.linearGradient(listOf(colors.primary, colors.tertiary))
+                    else Brush.linearGradient(listOf(colors.surfaceVariant, colors.surfaceVariant))
+                )
         ) {
             SelectionContainer {
-                Text(text, Modifier.padding(horizontal = 14.dp, vertical = 10.dp))
+                Text(
+                    text,
+                    Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    color = if (fromUser) Color.White else colors.onSurfaceVariant,
+                )
             }
         }
     }
 }
 
+/** Three dots that bounce one after another while the reply is being prepared. */
 @Composable
 private fun ThinkingBubble() {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-        Spacer(Modifier.size(8.dp))
-        Text("ভাবছি…", color = MaterialTheme.colorScheme.onSurfaceVariant)
+    val transition = rememberInfiniteTransition(label = "dots")
+    Row(
+        Modifier
+            .padding(start = 36.dp)
+            .clip(RoundedCornerShape(20.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        repeat(3) { index ->
+            val offset by transition.animateFloat(
+                initialValue = 0f,
+                targetValue = 0f,
+                animationSpec = infiniteRepeatable(
+                    keyframes {
+                        durationMillis = 900
+                        0f at 0 + index * 150
+                        -6f at 150 + index * 150
+                        0f at 300 + index * 150
+                    }
+                ),
+                label = "dot$index",
+            )
+            Box(
+                Modifier
+                    .offset(y = offset.dp)
+                    .size(8.dp)
+                    .clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.primary)
+            )
+        }
     }
 }
 
