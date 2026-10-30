@@ -83,7 +83,7 @@ class AssistantTest {
             ]"""),
             message("end_turn", """[{"type":"text","text":"মনে রাখলাম ✅"}]"""),
         ))
-        val assistant = Assistant(store, alarms, { requests += it; replies.removeFirst() }, "Masum", zone = { DHAKA }, now = { NOW })
+        val assistant = ClaudeAssistant(store, alarms, { requests += it; replies.removeFirst() }, "Masum", zone = { DHAKA }, now = { NOW })
 
         val reply = assistant.chat("হ্যালো")
         assertEquals("মনে রাখলাম ✅", reply.text)
@@ -149,5 +149,37 @@ class AssistantTest {
         val today = java.time.LocalDate.of(2026, 10, 30)
         assertEquals(2, streak(setOf("2026-10-28", "2026-10-29"), today))
         assertEquals(0, streak(setOf("2026-10-27"), today))
+    }
+
+    @Test
+    fun `gemini runs function calls and echoes model content back`() {
+        val store = InMemoryStore()
+        val bodies = mutableListOf<String>()
+        val replies = ArrayDeque(listOf(
+            """{"candidates":[{"content":{"role":"model","parts":[
+                {"functionCall":{"name":"add_item","args":{"list_name":"shopping","text":"দুধ"}},"thoughtSignature":"sig1"},
+                {"functionCall":{"name":"add_expense","args":{"amount":850,"category":"food","note":"বাজার"}}}
+            ]},"finishReason":"STOP"}]}""",
+            """{"candidates":[{"content":{"role":"model","parts":[{"text":"✅ শপিং লিস্টে দুধ, খরচ ৮৫০ টাকা"}]},"finishReason":"STOP"}]}""",
+        ))
+        val assistant = GeminiAssistant(store, RecordingAlarms(), { _, body -> bodies += body; replies.removeFirst() }, "Masum", zone = { DHAKA }, now = { NOW })
+
+        val reply = assistant.chat("দুধ কিনতে হবে, আজ বাজারে ৮৫০ টাকা খরচ")
+        assertEquals("✅ শপিং লিস্টে দুধ, খরচ ৮৫০ টাকা", reply.text)
+        assertEquals("দুধ", store.items.single().text)
+        assertEquals(850.0, store.expenseList.single().amount)
+
+        val first = jsonMapper().readTree(bodies[0])
+        val decls = first.path("tools")[0].path("functionDeclarations")
+        val setReminder = decls.first { it.path("name").asText() == "set_reminder" }.path("parameters")
+        assertEquals("STRING", setReminder.path("properties").path("when").path("type").asText())
+        val addItem = decls.first { it.path("name").asText() == "add_item" }.path("parameters")
+        assertTrue(addItem.path("properties").path("due_date").path("nullable").asBoolean())
+        assertEquals(listOf("list_name", "text"), addItem.path("required").map { it.asText() })
+
+        val second = jsonMapper().readTree(bodies[1]).path("contents")
+        assertEquals(listOf("user", "model", "user"), second.map { it.path("role").asText() })
+        assertEquals("sig1", second[1].path("parts")[0].path("thoughtSignature").asText())
+        assertEquals("add_expense", second[2].path("parts")[1].path("functionResponse").path("name").asText())
     }
 }

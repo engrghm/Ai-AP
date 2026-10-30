@@ -46,24 +46,51 @@ private val INT = mapOf("type" to "integer")
 
 private fun described(base: Map<String, Any>, description: String) = base + ("description" to description)
 
-private fun tool(name: String, description: String, properties: Map<String, Map<String, Any>>): BetaTool {
-    val props = BetaTool.InputSchema.Properties.builder()
-    properties.forEach { (key, schema) -> props.putAdditionalProperty(key, JsonValue.from(schema)) }
-    return BetaTool.builder()
-        .name(name)
-        .description(description)
-        .strict(true)
-        .inputSchema(
-            BetaTool.InputSchema.builder()
-                .properties(props.build())
-                .required(properties.keys.toList())
-                .putAdditionalProperty("additionalProperties", JsonValue.from(false))
-                .build()
-        )
-        .build()
+/** One tool, described once and translated for each AI service. Every property is required; optional ones are nullable. */
+class ToolSpec(val name: String, val description: String, val properties: Map<String, Map<String, Any>>) {
+    fun toClaude(): BetaTool {
+        val props = BetaTool.InputSchema.Properties.builder()
+        properties.forEach { (key, schema) -> props.putAdditionalProperty(key, JsonValue.from(schema)) }
+        return BetaTool.builder()
+            .name(name)
+            .description(description)
+            .strict(true)
+            .inputSchema(
+                BetaTool.InputSchema.builder()
+                    .properties(props.build())
+                    .required(properties.keys.toList())
+                    .putAdditionalProperty("additionalProperties", JsonValue.from(false))
+                    .build()
+            )
+            .build()
+    }
+
+    /** Gemini function declaration: OpenAPI-style schema, with `nullable` instead of a "null" type. */
+    fun toGemini(): Map<String, Any> {
+        val decl = mutableMapOf<String, Any>("name" to name, "description" to description)
+        if (properties.isNotEmpty()) {
+            decl["parameters"] = mapOf(
+                "type" to "OBJECT",
+                "properties" to properties.mapValues { (_, schema) ->
+                    val type = schema["type"]
+                    val types = if (type is List<*>) type.filterIsInstance<String>() else listOf(type as String)
+                    buildMap {
+                        put("type", types.first { it != "null" }.uppercase())
+                        if ("null" in types) put("nullable", true)
+                        schema["description"]?.let { put("description", it) }
+                        schema["enum"]?.let { put("enum", it) }
+                    }
+                },
+                "required" to properties.filterValues { (it["type"] as? List<*>)?.contains("null") != true }.keys.toList(),
+            )
+        }
+        return decl
+    }
 }
 
-val TOOL_DEFINITIONS: List<BetaTool> = listOf(
+private fun tool(name: String, description: String, properties: Map<String, Map<String, Any>>) = ToolSpec(name, description, properties)
+
+val TOOL_SPECS: List<ToolSpec> = listOf(
     tool(
         "remember",
         "Save a durable fact about the owner to long-term memory. Use whenever the owner shares something " +
@@ -160,6 +187,9 @@ val TOOL_DEFINITIONS: List<BetaTool> = listOf(
         ),
     ),
 )
+
+val TOOL_DEFINITIONS: List<BetaTool> = TOOL_SPECS.map { it.toClaude() }
+val GEMINI_FUNCTIONS: List<Map<String, Any>> = TOOL_SPECS.map { it.toGemini() }
 
 class ToolExecutor(
     private val store: Store,

@@ -20,11 +20,12 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
 const val DEFAULT_MODEL = "claude-opus-5-5"
-private const val MAX_TOOL_ROUNDS = 12
+const val DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+internal const val MAX_TOOL_ROUNDS = 12
 
 // Long-term knowledge lives in the Store, so the API transcript starts fresh once it gets long
 // instead of being trimmed (trimming would rewrite history).
-private const val MAX_TRANSCRIPT_MESSAGES = 60
+internal const val MAX_TRANSCRIPT_MESSAGES = 60
 private const val FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 private val SYSTEM_PROMPT = """
@@ -50,7 +51,7 @@ vague ("bikele", "sokale"), pick a sensible one and say so.
 `log_habit` when they say they did one.
 - When they want to call, message, email, find a place, search, or schedule something on the phone, \
 use `prepare_phone_action` so a tap-to-run button appears. Find numbers/emails in memory first.
-- Use web search for current information (prices, news, prayer times, weather, how-to) when needed.
+- Use web search, when available, for current information (prices, news, prayer times, weather, how-to).
 
 Answering and guiding:
 - Before answering anything about {owner}'s life, check your tools rather than guessing.
@@ -92,43 +93,29 @@ class ClaudeSender(private val client: AnthropicClient) : MessageSender {
     override fun send(params: MessageCreateParams): BetaMessage = client.beta().messages().create(params)
 }
 
-class Assistant(
-    private val store: Store,
+/**
+ * The assistant, independent of which AI service answers: it keeps the chat log, the tools and the
+ * per-turn context. [ClaudeAssistant] and [GeminiAssistant] supply the conversation with the model.
+ */
+abstract class Assistant(
+    protected val store: Store,
     alarms: AlarmScheduler,
-    private val sender: MessageSender,
-    private val ownerName: String,
-    private val model: String = DEFAULT_MODEL,
-    private val zone: () -> ZoneId = ZoneId::systemDefault,
-    private val now: () -> Long = System::currentTimeMillis,
+    protected val ownerName: String,
+    protected val zone: () -> ZoneId,
+    protected val now: () -> Long,
 ) {
-    private val tools = ToolExecutor(store, alarms, zone, now)
-    private val transcript = mutableListOf<BetaMessageParam>()
-    private val json = ObjectMapper()
-    private val system = listOf(
-        BetaTextBlockParam.builder()
-            .text(SYSTEM_PROMPT.replace("{owner}", ownerName))
-            .cacheControl(BetaCacheControlEphemeral.builder().build())
-            .build()
-    )
+    protected val tools = ToolExecutor(store, alarms, zone, now)
+    protected val json = ObjectMapper()
+    protected val systemPrompt = SYSTEM_PROMPT.replace("{owner}", ownerName)
 
-    private fun request(messages: List<BetaMessageParam>, effort: BetaOutputConfig.Effort, withTools: Boolean): BetaMessage {
-        val builder = MessageCreateParams.builder()
-            .model(model)
-            .maxTokens(16000L)
-            .systemOfBetaTextBlockParams(system)
-            .messages(messages)
-            .outputConfig(BetaOutputConfig.builder().effort(effort).build())
-            .addBeta(FALLBACK_BETA)
-            .fallbacks(BetaFallbacksParam.ofDefault())
-        if (withTools) {
-            TOOL_DEFINITIONS.forEach { builder.addTool(it) }
-            builder.addTool(BetaWebSearchTool20260209.builder().maxUses(3L).build())
-        }
-        return sender.send(builder.build())
-    }
+    /** Runs one turn (with tool calls) and returns the reply text. */
+    protected abstract fun runTurn(userText: String, contextNote: String): String
 
-    private fun BetaMessage.text(): String =
-        content().mapNotNull { block -> block.text().map { it.text() }.orElse(null) }.joinToString("\n").trim()
+    /** A single prompt without tools, for briefings. */
+    protected abstract fun complete(prompt: String): String
+
+    /** Forgets the model-side transcript. */
+    protected abstract fun clearTranscript()
 
     /** Per-turn context: current time plus what is due today, so guidance stays timely. */
     private fun contextNote(): String {
@@ -157,15 +144,11 @@ class Assistant(
     fun chat(userText: String): ChatReply {
         store.addChat(fromUser = true, text = userText)
         tools.takeActions() // drop anything left over from a failed turn
-        if (transcript.size >= MAX_TRANSCRIPT_MESSAGES) transcript.clear()
-        transcript += BetaMessageParam.ofUser(userText)
-        transcript += BetaMessageParam.ofSystem(contextNote())
-
         val reply = try {
-            runToolLoop()
+            runTurn(userText, contextNote())
         } catch (e: Exception) {
             // A failed turn may leave a dangling tool call; start a clean transcript next time.
-            transcript.clear()
+            clearTranscript()
             throw e
         }
         val actions = tools.takeActions()
@@ -173,39 +156,9 @@ class Assistant(
         return ChatReply(reply, actions)
     }
 
-    private fun runToolLoop(): String {
-        repeat(MAX_TOOL_ROUNDS) {
-            val response = request(transcript, BetaOutputConfig.Effort.MEDIUM, withTools = true)
-            val stop = response.stopReason().orElse(null)
-
-            if (stop == BetaStopReason.REFUSAL) {
-                val reply = "দুঃখিত, এই অনুরোধে আমি সাহায্য করতে পারছি না।"
-                transcript += BetaMessageParam.ofAssistant(reply)
-                return reply
-            }
-            transcript += response.toParam()
-            // A long server-side web search can pause; sending the turn back lets it continue.
-            if (stop == BetaStopReason.PAUSE_TURN) return@repeat
-            if (stop != BetaStopReason.TOOL_USE) return response.text().ifEmpty { "✅" }
-
-            val results = response.content().mapNotNull { it.toolUse().orElse(null) }.map { call ->
-                val result = BetaToolResultBlockParam.builder().toolUseId(call.id())
-                try {
-                    val input = call._input().convert(Map::class.java) ?: emptyMap<String, Any>()
-                    result.content(tools.run(call.name(), input))
-                } catch (e: Exception) {
-                    result.content(e.message ?: e.toString()).isError(true)
-                }
-                BetaContentBlockParam.ofToolResult(result.build())
-            }
-            transcript += BetaMessageParam.ofUserOfContentBlockParams(results)
-        }
-        return "অনেকগুলো ধাপ হয়ে গেছে, আরেকটু সহজ করে বলবেন?"
-    }
-
     /** A fresh conversation; saved memories, lists and reminders are untouched. */
     @Synchronized
-    fun reset() = transcript.clear()
+    fun reset() = clearTranscript()
 
     /** A morning plan or evening review ([kind] = "morning" / "evening"), generated from everything saved. */
     fun briefing(kind: String = "morning"): String {
@@ -221,6 +174,87 @@ class Assistant(
         )
         val prompt = BRIEFING_PROMPTS.getValue(kind).replace("{owner}", ownerName) + "\n\n" +
             json.writerWithDefaultPrettyPrinter().writeValueAsString(data)
+        return complete(prompt)
+    }
+
+    /** Runs a tool call, turning failures into an error message for the model. */
+    protected fun runTool(name: String, input: Map<*, *>): Pair<String, Boolean> = try {
+        tools.run(name, input) to false
+    } catch (e: Exception) {
+        (e.message ?: e.toString()) to true
+    }
+}
+
+class ClaudeAssistant(
+    store: Store,
+    alarms: AlarmScheduler,
+    private val sender: MessageSender,
+    ownerName: String,
+    private val model: String = DEFAULT_MODEL,
+    zone: () -> ZoneId = ZoneId::systemDefault,
+    now: () -> Long = System::currentTimeMillis,
+) : Assistant(store, alarms, ownerName, zone, now) {
+    private val transcript = mutableListOf<BetaMessageParam>()
+    private val system = listOf(
+        BetaTextBlockParam.builder()
+            .text(systemPrompt)
+            .cacheControl(BetaCacheControlEphemeral.builder().build())
+            .build()
+    )
+
+    private fun request(messages: List<BetaMessageParam>, effort: BetaOutputConfig.Effort, withTools: Boolean): BetaMessage {
+        val builder = MessageCreateParams.builder()
+            .model(model)
+            .maxTokens(16000L)
+            .systemOfBetaTextBlockParams(system)
+            .messages(messages)
+            .outputConfig(BetaOutputConfig.builder().effort(effort).build())
+            .addBeta(FALLBACK_BETA)
+            .fallbacks(BetaFallbacksParam.ofDefault())
+        if (withTools) {
+            TOOL_DEFINITIONS.forEach { builder.addTool(it) }
+            builder.addTool(BetaWebSearchTool20260209.builder().maxUses(3L).build())
+        }
+        return sender.send(builder.build())
+    }
+
+    private fun BetaMessage.text(): String =
+        content().mapNotNull { block -> block.text().map { it.text() }.orElse(null) }.joinToString("\n").trim()
+
+    override fun clearTranscript() = transcript.clear()
+
+    override fun runTurn(userText: String, contextNote: String): String {
+        if (transcript.size >= MAX_TRANSCRIPT_MESSAGES) transcript.clear()
+        transcript += BetaMessageParam.ofUser(userText)
+        transcript += BetaMessageParam.ofSystem(contextNote)
+
+        repeat(MAX_TOOL_ROUNDS) {
+            val response = request(transcript, BetaOutputConfig.Effort.MEDIUM, withTools = true)
+            val stop = response.stopReason().orElse(null)
+
+            if (stop == BetaStopReason.REFUSAL) {
+                val reply = "দুঃখিত, এই অনুরোধে আমি সাহায্য করতে পারছি না।"
+                transcript += BetaMessageParam.ofAssistant(reply)
+                return reply
+            }
+            transcript += response.toParam()
+            // A long server-side web search can pause; sending the turn back lets it continue.
+            if (stop == BetaStopReason.PAUSE_TURN) return@repeat
+            if (stop != BetaStopReason.TOOL_USE) return response.text().ifEmpty { "✅" }
+
+            val results = response.content().mapNotNull { it.toolUse().orElse(null) }.map { call ->
+                val input = runCatching { call._input().convert(Map::class.java) }.getOrNull() ?: emptyMap<String, Any>()
+                val (output, isError) = runTool(call.name(), input)
+                BetaContentBlockParam.ofToolResult(
+                    BetaToolResultBlockParam.builder().toolUseId(call.id()).content(output).isError(isError).build()
+                )
+            }
+            transcript += BetaMessageParam.ofUserOfContentBlockParams(results)
+        }
+        return "অনেকগুলো ধাপ হয়ে গেছে, আরেকটু সহজ করে বলবেন?"
+    }
+
+    override fun complete(prompt: String): String {
         val response = request(listOf(BetaMessageParam.ofUser(prompt)), BetaOutputConfig.Effort.LOW, withTools = false)
         if (response.stopReason().orElse(null) == BetaStopReason.REFUSAL) return ""
         return response.text()

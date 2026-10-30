@@ -52,6 +52,7 @@ import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -203,7 +204,8 @@ private fun ChatScreen(vm: MainViewModel) {
             val text = if (input.isBlank()) spoken else "$input $spoken"
             if (vm.settings.autoSendVoice && vm.pending == null) {
                 vm.send(text)
-                input = ""
+                // Keep the words if sending did not start (e.g. no API key yet).
+                input = if (vm.pending != null) "" else text
             } else {
                 input = text
             }
@@ -342,7 +344,7 @@ private fun MemoryScreen(vm: MainViewModel) {
     var query by rememberSaveable { mutableStateOf("") }
     var editing by remember { mutableStateOf<Memory?>(null) }
     val filtered = vm.memories.filter { query.isBlank() || it.content.contains(query, ignoreCase = true) }
-    // Known categories first, in a fixed order; anything Claude invented after them.
+    // Known categories first, in a fixed order; anything the AI invented after them.
     val order = MEMORY_CATEGORIES.keys.toList()
     val groups = filtered.groupBy { it.category }.toList()
         .sortedBy { (category, _) -> order.indexOf(category).let { if (it < 0) order.size else it } }
@@ -664,9 +666,13 @@ private fun money(value: Double): String =
 
 // ---------------------------------------------------------------- settings
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SettingsDialog(vm: MainViewModel, onDismiss: () -> Unit) {
     var name by rememberSaveable { mutableStateOf(vm.settings.ownerName) }
+    var provider by rememberSaveable { mutableStateOf(vm.settings.provider) }
+    var geminiKey by rememberSaveable { mutableStateOf(vm.settings.geminiKey) }
+    var geminiModel by rememberSaveable { mutableStateOf(vm.settings.geminiModel) }
     var apiKey by rememberSaveable { mutableStateOf(vm.settings.apiKey) }
     var briefing by rememberSaveable { mutableStateOf(vm.settings.briefingTime) }
     var evening by rememberSaveable { mutableStateOf(vm.settings.eveningTime) }
@@ -689,18 +695,44 @@ private fun SettingsDialog(vm: MainViewModel, onDismiss: () -> Unit) {
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("আপনার নাম") }, singleLine = true)
-                OutlinedTextField(
-                    value = apiKey,
-                    onValueChange = { apiKey = it },
-                    label = { Text("Claude API key") },
-                    placeholder = { Text("sk-ant-…") },
-                    singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(),
-                )
-                Text(
-                    "console.anthropic.com থেকে API key নিন। এটি শুধু এই ফোনে থাকে।",
-                    style = MaterialTheme.typography.bodySmall,
-                )
+                Text("কোন AI ব্যবহার করবেন", style = MaterialTheme.typography.labelLarge)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(selected = provider == "gemini", onClick = { provider = "gemini" }, label = { Text("Google Gemini") })
+                    FilterChip(selected = provider == "claude", onClick = { provider = "claude" }, label = { Text("Claude") })
+                }
+                if (provider == "gemini") {
+                    OutlinedTextField(
+                        value = geminiKey,
+                        onValueChange = { geminiKey = it },
+                        label = { Text("Gemini API key") },
+                        placeholder = { Text("AIza…") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                    )
+                    OutlinedTextField(
+                        value = geminiModel,
+                        onValueChange = { geminiModel = it },
+                        label = { Text("Gemini মডেল") },
+                        singleLine = true,
+                    )
+                    Text(
+                        "aistudio.google.com/apikey থেকে API key নিন। এটি শুধু এই ফোনে থাকে।",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                } else {
+                    OutlinedTextField(
+                        value = apiKey,
+                        onValueChange = { apiKey = it },
+                        label = { Text("Claude API key") },
+                        placeholder = { Text("sk-ant-…") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                    )
+                    Text(
+                        "console.anthropic.com থেকে API key নিন। এটি শুধু এই ফোনে থাকে।",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
                 OutlinedTextField(
                     value = briefing,
                     onValueChange = { briefing = it },
@@ -718,10 +750,22 @@ private fun SettingsDialog(vm: MainViewModel, onDismiss: () -> Unit) {
                 HorizontalDivider()
                 Text("ব্যাকআপ (নতুন ফোনে নিতে বা নিরাপদে রাখতে)", style = MaterialTheme.typography.labelLarge)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilledTonalButton(onClick = { exportLauncher.launch("amar-sohokari-backup-${java.time.LocalDate.now()}.json") }) {
+                    FilledTonalButton(onClick = {
+                        try {
+                            exportLauncher.launch("amar-sohokari-backup-${java.time.LocalDate.now()}.json")
+                        } catch (e: ActivityNotFoundException) {
+                            vm.error = "ফাইল সংরক্ষণের অ্যাপ পাওয়া যায়নি।"
+                        }
+                    }) {
                         Text("সংরক্ষণ")
                     }
-                    FilledTonalButton(onClick = { importLauncher.launch(arrayOf("application/json", "text/plain", "*/*")) }) {
+                    FilledTonalButton(onClick = {
+                        try {
+                            importLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
+                        } catch (e: ActivityNotFoundException) {
+                            vm.error = "ফাইল খোলার অ্যাপ পাওয়া যায়নি।"
+                        }
+                    }) {
                         Text("ফিরিয়ে আনুন")
                     }
                 }
@@ -733,7 +777,7 @@ private fun SettingsDialog(vm: MainViewModel, onDismiss: () -> Unit) {
         },
         confirmButton = {
             TextButton(onClick = {
-                vm.saveSettings(name, apiKey, briefing, evening, autoSend, speak)
+                vm.saveSettings(name, provider, geminiKey, geminiModel, apiKey, briefing, evening, autoSend, speak)
                 onDismiss()
             }) { Text("সংরক্ষণ") }
         },

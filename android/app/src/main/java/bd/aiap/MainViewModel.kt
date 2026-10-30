@@ -44,7 +44,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         private set
     var error by mutableStateOf<String?>(null)
     var info by mutableStateOf<String?>(null)
-    var hasApiKey by mutableStateOf(app.settings.apiKey.isNotEmpty())
+    var hasApiKey by mutableStateOf(app.settings.activeKey.isNotEmpty())
         private set
     var canScheduleExact by mutableStateOf(app.alarms.canScheduleExact())
         private set
@@ -106,7 +106,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun requireKey(): Boolean {
-        if (!hasApiKey) error = "প্রথমে সেটিংসে Claude API key দিন।"
+        if (!hasApiKey) error = "প্রথমে সেটিংসে API key দিন।"
         return hasApiKey
     }
 
@@ -115,7 +115,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (message.isEmpty() || pending != null || !requireKey()) return
         pending = message
         error = null
-        app.speaker.stop()
+        app.stopSpeaking()
         viewModelScope.launch {
             try {
                 // Building the HTTP client the first time is slow, so do it off the main thread too.
@@ -156,6 +156,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun saveSettings(
         name: String,
+        provider: String,
+        geminiKey: String,
+        geminiModel: String,
         apiKey: String,
         briefingTime: String,
         eveningTime: String,
@@ -163,13 +166,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         speakReplies: Boolean,
     ) {
         app.settings.ownerName = name
+        app.settings.provider = provider
+        app.settings.geminiKey = geminiKey
+        app.settings.geminiModel = geminiModel
         app.settings.apiKey = apiKey
         app.settings.briefingTime = normalizeTime(briefingTime)
         app.settings.eveningTime = normalizeTime(eveningTime)
         app.settings.autoSendVoice = autoSendVoice
         app.settings.speakReplies = speakReplies
-        if (!speakReplies) app.speaker.stop()
-        hasApiKey = app.settings.apiKey.isNotEmpty()
+        if (!speakReplies) app.stopSpeaking()
+        hasApiKey = app.settings.activeKey.isNotEmpty()
         app.alarms.scheduleBriefing(app.settings.briefingTime)
         app.alarms.scheduleEvening(app.settings.eveningTime)
     }

@@ -25,7 +25,8 @@ class MainActivity : ComponentActivity() {
             notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
         AiApp.from(this).alarms.rescheduleAll()
-        handleShortcut(intent)
+        // Only on a fresh start: after rotation the old shortcut intent must not start listening again.
+        if (savedInstanceState == null) handleShortcut(intent)
         setContent {
             AppTheme {
                 AppRoot(viewModel)
@@ -35,6 +36,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
         handleShortcut(intent)
     }
 

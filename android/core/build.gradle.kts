@@ -15,6 +15,7 @@ kotlin {
 
 dependencies {
     api("com.anthropic:anthropic-java:3.3.0")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     testImplementation(kotlin("test"))
 }
 

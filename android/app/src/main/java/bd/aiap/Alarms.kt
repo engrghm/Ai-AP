@@ -189,7 +189,7 @@ class BootReceiver : BroadcastReceiver() {
     }
 }
 
-/** Asks Claude for today's plan in the background and posts it as a notification. */
+/** Asks the AI for today's plan in the background and posts it as a notification. */
 class BriefingWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
     override fun doWork(): Result {
         val assistant = AiApp.from(applicationContext).assistant() ?: return Result.success()

@@ -5,14 +5,36 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import bd.aiap.core.Assistant
+import bd.aiap.core.ClaudeAssistant
 import bd.aiap.core.ClaudeSender
+import bd.aiap.core.DEFAULT_GEMINI_MODEL
+import bd.aiap.core.GeminiAssistant
+import bd.aiap.core.GeminiHttp
 
 class Settings(context: Context) {
     private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
 
+    /** "gemini" or "claude". */
+    var provider: String
+        get() = prefs.getString("provider", "gemini") ?: "gemini"
+        set(value) = prefs.edit().putString("provider", value).apply()
+
+    /** Claude API key. */
     var apiKey: String
         get() = prefs.getString("api_key", "") ?: ""
         set(value) = prefs.edit().putString("api_key", value.trim()).apply()
+
+    var geminiKey: String
+        get() = prefs.getString("gemini_key", "") ?: ""
+        set(value) = prefs.edit().putString("gemini_key", value.trim()).apply()
+
+    var geminiModel: String
+        get() = prefs.getString("gemini_model", DEFAULT_GEMINI_MODEL)?.ifBlank { DEFAULT_GEMINI_MODEL } ?: DEFAULT_GEMINI_MODEL
+        set(value) = prefs.edit().putString("gemini_model", value.trim()).apply()
+
+    /** The key for the chosen service. */
+    val activeKey: String
+        get() = if (provider == "claude") apiKey else geminiKey
 
     var ownerName: String
         get() = prefs.getString("owner_name", "") ?: ""
@@ -46,10 +68,19 @@ class AiApp : Application() {
         private set
     lateinit var alarms: AndroidAlarms
         private set
-    val speaker by lazy { Speaker(this) }
+    private var speakerInstance: Speaker? = null
+
+    /** Created on first use, so the speech engine only starts when reading aloud is on. */
+    @get:Synchronized
+    val speaker: Speaker
+        get() = speakerInstance ?: Speaker(this).also { speakerInstance = it }
+
+    fun stopSpeaking() {
+        speakerInstance?.stop()
+    }
 
     private var assistant: Assistant? = null
-    private var assistantKey: Pair<String, String>? = null
+    private var assistantKey: List<String>? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -62,15 +93,16 @@ class AiApp : Application() {
     /** The assistant for the current settings, or null until an API key is set. */
     @Synchronized
     fun assistant(): Assistant? {
-        val key = settings.apiKey to settings.ownerName
-        if (key.first.isEmpty()) return null
+        val apiKey = settings.activeKey
+        if (apiKey.isEmpty()) return null
+        val key = listOf(settings.provider, apiKey, settings.ownerName, settings.geminiModel)
         if (assistant == null || assistantKey != key) {
-            assistant = Assistant(
-                store = store,
-                alarms = alarms,
-                sender = ClaudeSender(key.first),
-                ownerName = key.second.ifEmpty { "বন্ধু" },
-            )
+            val owner = settings.ownerName.ifEmpty { "বন্ধু" }
+            assistant = if (settings.provider == "claude") {
+                ClaudeAssistant(store = store, alarms = alarms, sender = ClaudeSender(apiKey), ownerName = owner)
+            } else {
+                GeminiAssistant(store = store, alarms = alarms, transport = GeminiHttp(apiKey), ownerName = owner, model = settings.geminiModel)
+            }
             assistantKey = key
         }
         return assistant
@@ -82,7 +114,7 @@ class AiApp : Application() {
             NotificationChannel(CHANNEL_REMINDERS, "রিমাইন্ডার", NotificationManager.IMPORTANCE_HIGH)
         )
         manager.createNotificationChannel(
-            NotificationChannel(CHANNEL_BRIEFING, "সকালের ব্রিফিং", NotificationManager.IMPORTANCE_DEFAULT)
+            NotificationChannel(CHANNEL_BRIEFING, "সকাল ও রাতের সারাংশ", NotificationManager.IMPORTANCE_DEFAULT)
         )
     }
 

@@ -23,7 +23,8 @@ object PhoneActions {
                 val digits = number.removePrefix("+").let { if (it.startsWith("01") && it.length == 11) "88$it" else it }
                 Intent(Intent.ACTION_VIEW, Uri.parse("https://wa.me/$digits?text=" + Uri.encode(action.text.orEmpty())))
             }
-            "email" -> Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:" + Uri.encode(target)))
+            "email" -> Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:"))
+                .putExtra(Intent.EXTRA_EMAIL, arrayOf(target))
                 .putExtra(Intent.EXTRA_SUBJECT, action.label)
                 .putExtra(Intent.EXTRA_TEXT, action.text.orEmpty())
             "map" -> Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=" + Uri.encode(target)))
