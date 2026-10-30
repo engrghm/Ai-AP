@@ -114,7 +114,7 @@ fun AppRoot(vm: MainViewModel) {
                 title = { Text(tab.title) },
                 actions = {
                     if (tab == Tab.CHAT) {
-                        IconButton(onClick = vm::briefingNow) { Icon(Icons.Filled.WbSunny, "আজকের পরিকল্পনা") }
+                        IconButton(onClick = vm::briefingNow, enabled = vm.pending == null) { Icon(Icons.Filled.WbSunny, "আজকের পরিকল্পনা") }
                     }
                     IconButton(onClick = { showSettings = true }) { Icon(Icons.Filled.Settings, "সেটিংস") }
                 },
@@ -418,16 +418,20 @@ private fun RemindersScreen(vm: MainViewModel) {
         contentPadding = PaddingValues(12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        if (!vm.canScheduleExact() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        if (!vm.canScheduleExact && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             item {
                 Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)) {
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text("রিমাইন্ডার ঠিক সময়ে পেতে \"Alarms & reminders\" অনুমতি দিন। না দিলে কয়েক মিনিট দেরি হতে পারে।")
                         Button(onClick = {
-                            context.startActivity(
-                                Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM)
-                                    .setData(android.net.Uri.parse("package:${context.packageName}"))
-                            )
+                            try {
+                                context.startActivity(
+                                    Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM)
+                                        .setData(android.net.Uri.parse("package:${context.packageName}"))
+                                )
+                            } catch (e: ActivityNotFoundException) {
+                                vm.error = "ফোনের Settings → Apps → আমার সহকারী → Alarms & reminders থেকে অনুমতি দিন।"
+                            }
                         }) { Text("অনুমতি দিন") }
                     }
                 }
@@ -491,9 +495,9 @@ private fun EmptyHint(text: String) {
 
 @Composable
 private fun SettingsDialog(vm: MainViewModel, onDismiss: () -> Unit) {
-    var name by remember { mutableStateOf(vm.settings.ownerName) }
-    var apiKey by remember { mutableStateOf(vm.settings.apiKey) }
-    var briefing by remember { mutableStateOf(vm.settings.briefingTime) }
+    var name by rememberSaveable { mutableStateOf(vm.settings.ownerName) }
+    var apiKey by rememberSaveable { mutableStateOf(vm.settings.apiKey) }
+    var briefing by rememberSaveable { mutableStateOf(vm.settings.briefingTime) }
 
     AlertDialog(
         onDismissRequest = onDismiss,

@@ -33,6 +33,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     var error by mutableStateOf<String?>(null)
     var hasApiKey by mutableStateOf(app.settings.apiKey.isNotEmpty())
         private set
+    var canScheduleExact by mutableStateOf(app.alarms.canScheduleExact())
+        private set
 
     init {
         refresh()
@@ -59,6 +61,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             memories = data.memories
             items = data.items
             reminders = data.reminders
+            canScheduleExact = app.alarms.canScheduleExact()
         }
     }
 
@@ -72,8 +75,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun send(text: String) {
         val message = text.trim()
         if (message.isEmpty() || pending != null) return
-        val assistant = app.assistant()
-        if (assistant == null) {
+        if (!hasApiKey) {
             error = "প্রথমে সেটিংসে Claude API key দিন।"
             return
         }
@@ -81,7 +83,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         error = null
         viewModelScope.launch {
             try {
-                withContext(Dispatchers.IO) { assistant.chat(message) }
+                // Building the HTTP client the first time is slow, so do it off the main thread too.
+                withContext(Dispatchers.IO) { app.assistant()?.chat(message) }
             } catch (e: Exception) {
                 error = "উত্তর আনা যায়নি: ${e.message ?: e.javaClass.simpleName}"
             } finally {
@@ -92,16 +95,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun briefingNow() {
-        val assistant = app.assistant()
-        if (assistant == null) {
+        if (pending != null) return
+        if (!hasApiKey) {
             error = "প্রথমে সেটিংসে Claude API key দিন।"
             return
         }
         pending = "আজকের পরিকল্পনা"
         viewModelScope.launch {
             try {
-                val text = withContext(Dispatchers.IO) { assistant.briefing() }
-                withContext(Dispatchers.IO) { app.store.addChat(fromUser = false, text = "🌅 $text") }
+                withContext(Dispatchers.IO) {
+                    val text = app.assistant()?.briefing().orEmpty()
+                    if (text.isNotBlank()) app.store.addChat(fromUser = false, text = "🌅 $text")
+                }
             } catch (e: Exception) {
                 error = "ব্রিফিং আনা যায়নি: ${e.message ?: e.javaClass.simpleName}"
             } finally {
@@ -114,7 +119,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun saveSettings(name: String, apiKey: String, briefingTime: String) {
         app.settings.ownerName = name
         app.settings.apiKey = apiKey
-        app.settings.briefingTime = briefingTime
+        app.settings.briefingTime = normalizeTime(briefingTime)
         hasApiKey = app.settings.apiKey.isNotEmpty()
         app.alarms.scheduleBriefing(app.settings.briefingTime)
     }
@@ -134,5 +139,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         app.store.deactivateReminder(reminder.id)
     }
 
-    fun canScheduleExact() = app.alarms.canScheduleExact()
+}
+
+/** Accepts "8:00", "08:00" or "8" and returns "08:00"; anything else turns the briefing off. */
+fun normalizeTime(input: String): String {
+    val match = Regex("""^\s*(\d{1,2})(?::(\d{2}))?\s*$""").find(input) ?: return ""
+    val hour = match.groupValues[1].toInt()
+    val minute = match.groupValues[2].ifEmpty { "0" }.toInt()
+    return if (hour in 0..23 && minute in 0..59) "%02d:%02d".format(hour, minute) else ""
 }
