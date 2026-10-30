@@ -24,8 +24,7 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - uses: android-actions/setup-android@v3
-
+      # GitHub's Ubuntu runners ship the Android SDK (ANDROID_HOME); Gradle fetches any missing platform.
       - uses: gradle/actions/setup-gradle@v4
 
       - name: Test core logic and build APK
