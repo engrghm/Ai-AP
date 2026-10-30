@@ -16,31 +16,82 @@ fun interface GeminiTransport {
     fun generate(model: String, body: String): String
 }
 
-class GeminiHttp(private val apiKey: String) : GeminiTransport {
-    private val client = OkHttpClient.Builder()
+/** Status code and body of one HTTP response. */
+data class HttpResult(val code: Int, val body: String)
+
+/**
+ * Calls Gemini with a list of API keys. When a key fails in a way another key could fix (limit reached,
+ * invalid or blocked key, server or network error), the next key is tried automatically, and the key
+ * that worked is used first next time.
+ */
+class GeminiHttp(
+    apiKeys: List<String>,
+    private val post: (key: String, model: String, body: String) -> HttpResult = ::okHttpPost,
+) : GeminiTransport {
+    private val keys = apiKeys.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+    private val mapper = com.fasterxml.jackson.databind.ObjectMapper()
+
+    @Volatile
+    var currentKey = 0
+        private set
+
+    val keyCount get() = keys.size
+
+    override fun generate(model: String, body: String): String {
+        if (keys.isEmpty()) throw GeminiException("সেটিংসে অন্তত একটি Gemini API key দিন।")
+        var lastProblem = ""
+        for (attempt in keys.indices) {
+            val index = (currentKey + attempt) % keys.size
+            val result = try {
+                post(keys[index], model, body)
+            } catch (e: java.io.IOException) {
+                lastProblem = "ইন্টারনেট সংযোগে সমস্যা (${e.message})"
+                continue
+            }
+            if (result.code in 200..299) {
+                currentKey = index
+                return result.body
+            }
+            val detail = runCatching { mapper.readTree(result.body).path("error").path("message").asText() }.getOrDefault("")
+            val keyProblem = result.code == 429 || result.code == 401 || result.code == 403 || result.code >= 500 ||
+                (result.code == 400 && "API key" in detail)
+            if (!keyProblem) {
+                // Same answer from every key (bad request, unknown model): no point trying the others.
+                throw GeminiException(
+                    if (result.code == 404) "Gemini মডেল \"$model\" পাওয়া যায়নি। সেটিংসে সঠিক মডেলের নাম দিন।"
+                    else "Gemini থেকে উত্তর আসেনি (${result.code}): $detail"
+                )
+            }
+            lastProblem = when {
+                result.code == 429 -> "ব্যবহারের সীমা শেষ"
+                result.code >= 500 -> "Gemini সার্ভারে সমস্যা (${result.code})"
+                else -> "key সঠিক নয় বা বন্ধ"
+            }
+        }
+        throw GeminiException(
+            if (keys.size == 1) "Gemini কাজ করছে না: $lastProblem। কিছুক্ষণ পরে চেষ্টা করুন বা সেটিংসে আরেকটি key যোগ করুন।"
+            else "সবগুলো (${banglaDigits(keys.size)}টি) Gemini key চেষ্টা করা হয়েছে, কোনোটিই কাজ করেনি। শেষ সমস্যা: $lastProblem।"
+        )
+    }
+}
+
+private fun banglaDigits(n: Int) = n.toString().map { if (it.isDigit()) '০' + (it - '0') else it }.joinToString("")
+
+private val sharedClient by lazy {
+    OkHttpClient.Builder()
         .callTimeout(120, TimeUnit.SECONDS)
         .readTimeout(120, TimeUnit.SECONDS)
         .build()
-    private val mapper = com.fasterxml.jackson.databind.ObjectMapper()
+}
 
-    override fun generate(model: String, body: String): String {
-        val request = Request.Builder()
-            .url("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent")
-            .header("x-goog-api-key", apiKey)
-            .post(body.toRequestBody("application/json".toMediaType()))
-            .build()
-        client.newCall(request).execute().use { response ->
-            val text = response.body?.string().orEmpty()
-            if (response.isSuccessful) return text
-            val detail = runCatching { mapper.readTree(text).path("error").path("message").asText() }.getOrDefault("")
-            throw GeminiException(
-                when {
-                    response.code == 429 -> "Gemini-এর ব্যবহারের সীমা এই মুহূর্তে শেষ। কিছুক্ষণ পরে আবার চেষ্টা করুন।"
-                    "API key" in detail || response.code == 401 || response.code == 403 -> "Gemini API key সঠিক নয়। সেটিংসে ঠিক key দিন।"
-                    else -> "Gemini থেকে উত্তর আসেনি (${response.code}): $detail"
-                }
-            )
-        }
+private fun okHttpPost(key: String, model: String, body: String): HttpResult {
+    val request = Request.Builder()
+        .url("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent")
+        .header("x-goog-api-key", key)
+        .post(body.toRequestBody("application/json".toMediaType()))
+        .build()
+    sharedClient.newCall(request).execute().use { response ->
+        return HttpResult(response.code, response.body?.string().orEmpty())
     }
 }
 

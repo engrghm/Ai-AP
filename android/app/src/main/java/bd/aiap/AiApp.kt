@@ -24,9 +24,13 @@ class Settings(context: Context) {
         get() = prefs.getString("api_key", "") ?: ""
         set(value) = prefs.edit().putString("api_key", value.trim()).apply()
 
+    /** All Gemini keys, one per line; the app moves to the next one when a key stops working. */
     var geminiKey: String
         get() = prefs.getString("gemini_key", "") ?: ""
         set(value) = prefs.edit().putString("gemini_key", value.trim()).apply()
+
+    val geminiKeys: List<String>
+        get() = splitKeys(geminiKey)
 
     var geminiModel: String
         get() = prefs.getString("gemini_model", DEFAULT_GEMINI_MODEL)?.ifBlank { DEFAULT_GEMINI_MODEL } ?: DEFAULT_GEMINI_MODEL
@@ -60,6 +64,8 @@ class Settings(context: Context) {
         get() = prefs.getBoolean("speak_replies", false)
         set(value) = prefs.edit().putBoolean("speak_replies", value).apply()
 }
+
+fun splitKeys(text: String): List<String> = text.split('\n', ',', ' ').map { it.trim() }.filter { it.isNotEmpty() }.distinct()
 
 class AiApp : Application() {
     lateinit var store: SqliteStore
@@ -101,7 +107,13 @@ class AiApp : Application() {
             assistant = if (settings.provider == "claude") {
                 ClaudeAssistant(store = store, alarms = alarms, sender = ClaudeSender(apiKey), ownerName = owner)
             } else {
-                GeminiAssistant(store = store, alarms = alarms, transport = GeminiHttp(apiKey), ownerName = owner, model = settings.geminiModel)
+                GeminiAssistant(
+                    store = store,
+                    alarms = alarms,
+                    transport = GeminiHttp(settings.geminiKeys),
+                    ownerName = owner,
+                    model = settings.geminiModel,
+                )
             }
             assistantKey = key
         }

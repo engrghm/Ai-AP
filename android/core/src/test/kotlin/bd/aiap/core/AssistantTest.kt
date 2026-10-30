@@ -182,4 +182,45 @@ class AssistantTest {
         assertEquals("sig1", second[1].path("parts")[0].path("thoughtSignature").asText())
         assertEquals("add_expense", second[2].path("parts")[1].path("functionResponse").path("name").asText())
     }
+
+    @Test
+    fun `gemini switches to the next key when one fails`() {
+        val tried = mutableListOf<String>()
+        val status = mutableMapOf("k1" to 429, "k2" to 200, "k3" to 200)
+        val http = GeminiHttp(listOf("k1", " k2 ", "", "k3", "k1")) { key, _, _ ->
+            tried += key
+            HttpResult(status.getValue(key), if (status[key] == 200) "ok-$key" else """{"error":{"message":"quota"}}""")
+        }
+        assertEquals(3, http.keyCount) // blanks and duplicates dropped
+        assertEquals("ok-k2", http.generate("m", "{}"))
+        assertEquals(listOf("k1", "k2"), tried)
+
+        // The working key is tried first next time.
+        tried.clear()
+        assertEquals("ok-k2", http.generate("m", "{}"))
+        assertEquals(listOf("k2"), tried)
+
+        // Network errors and server errors also move on; it wraps around to the start.
+        status["k2"] = 503
+        tried.clear()
+        status["k3"] = 403
+        status["k1"] = 200
+        assertEquals("ok-k1", http.generate("m", "{}"))
+        assertEquals(listOf("k2", "k3", "k1"), tried)
+
+        // Every key failing gives one clear message.
+        status["k1"] = 429
+        val all = runCatching { http.generate("m", "{}") }.exceptionOrNull()
+        assertTrue(all is GeminiException && "৩টি" in all.message!!, all.toString())
+
+        // A wrong model name fails the same on every key, so it is not retried.
+        tried.clear()
+        status["k1"] = 404
+        val notFound = runCatching { http.generate("bad-model", "{}") }.exceptionOrNull()
+        assertTrue(notFound is GeminiException && "bad-model" in notFound.message!!)
+        assertEquals(1, tried.size)
+
+        val offline = GeminiHttp(listOf("a", "b")) { key, _, _ -> if (key == "a") throw java.io.IOException("timeout") else HttpResult(200, "ok") }
+        assertEquals("ok", offline.generate("m", "{}"))
+    }
 }

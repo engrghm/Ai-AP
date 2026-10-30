@@ -83,6 +83,7 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import bd.aiap.HabitRow
 import bd.aiap.MainViewModel
+import bd.aiap.splitKeys
 import bd.aiap.core.EXPENSE_CATEGORIES
 import bd.aiap.core.Expense
 import bd.aiap.core.ListItem
@@ -672,6 +673,7 @@ private fun SettingsDialog(vm: MainViewModel, onDismiss: () -> Unit) {
     var name by rememberSaveable { mutableStateOf(vm.settings.ownerName) }
     var provider by rememberSaveable { mutableStateOf(vm.settings.provider) }
     var geminiKey by rememberSaveable { mutableStateOf(vm.settings.geminiKey) }
+    var newGeminiKey by rememberSaveable { mutableStateOf("") }
     var geminiModel by rememberSaveable { mutableStateOf(vm.settings.geminiModel) }
     var apiKey by rememberSaveable { mutableStateOf(vm.settings.apiKey) }
     var briefing by rememberSaveable { mutableStateOf(vm.settings.briefingTime) }
@@ -701,14 +703,7 @@ private fun SettingsDialog(vm: MainViewModel, onDismiss: () -> Unit) {
                     FilterChip(selected = provider == "claude", onClick = { provider = "claude" }, label = { Text("Claude") })
                 }
                 if (provider == "gemini") {
-                    OutlinedTextField(
-                        value = geminiKey,
-                        onValueChange = { geminiKey = it },
-                        label = { Text("Gemini API key") },
-                        placeholder = { Text("AIza…") },
-                        singleLine = true,
-                        visualTransformation = PasswordVisualTransformation(),
-                    )
+                    GeminiKeysEditor(geminiKey, { geminiKey = it }, newGeminiKey, { newGeminiKey = it })
                     OutlinedTextField(
                         value = geminiModel,
                         onValueChange = { geminiModel = it },
@@ -777,12 +772,63 @@ private fun SettingsDialog(vm: MainViewModel, onDismiss: () -> Unit) {
         },
         confirmButton = {
             TextButton(onClick = {
-                vm.saveSettings(name, provider, geminiKey, geminiModel, apiKey, briefing, evening, autoSend, speak)
+                // A key typed but not yet added with "যোগ" is kept too.
+                val allGeminiKeys = (splitKeys(geminiKey) + splitKeys(newGeminiKey)).distinct().joinToString("\n")
+                vm.saveSettings(name, provider, allGeminiKeys, geminiModel, apiKey, briefing, evening, autoSend, speak)
                 onDismiss()
             }) { Text("সংরক্ষণ") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("বাতিল") } },
     )
+}
+
+/**
+ * Gemini keys as a list: add as many as you like; when one stops working (limit reached, blocked,
+ * server error) the app automatically uses the next. Keys are kept as newline-separated text so
+ * the dialog state survives rotation.
+ */
+@Composable
+private fun GeminiKeysEditor(keys: String, onChange: (String) -> Unit, newKey: String, onNewKey: (String) -> Unit) {
+    val list = splitKeys(keys)
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text("Gemini API key (${list.size}টি)", style = MaterialTheme.typography.labelLarge)
+        list.forEachIndexed { index, key ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "${index + 1}. ${key.take(6)}…${key.takeLast(4)}" + if (index == 0) "  (প্রথমে)" else "",
+                    Modifier.weight(1f),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                IconButton(onClick = { onChange((list - key).joinToString("\n")) }) {
+                    Icon(Icons.Filled.Delete, contentDescription = "key মুছুন", tint = MaterialTheme.colorScheme.outline)
+                }
+            }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = newKey,
+                onValueChange = onNewKey,
+                modifier = Modifier.weight(1f),
+                label = { Text(if (list.isEmpty()) "Gemini API key" else "আরেকটি key যোগ করুন") },
+                placeholder = { Text("AIza…") },
+                singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
+            )
+            TextButton(
+                onClick = {
+                    onChange((list + splitKeys(newKey)).distinct().joinToString("\n"))
+                    onNewKey("")
+                },
+                enabled = newKey.isNotBlank(),
+            ) { Text("যোগ") }
+        }
+        if (list.size > 1) {
+            Text(
+                "একটি key কাজ না করলে (সীমা শেষ, বন্ধ, সার্ভার সমস্যা) অ্যাপ নিজে থেকেই পরেরটি ব্যবহার করবে।",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+    }
 }
 
 @Composable
